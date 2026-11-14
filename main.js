@@ -1,0 +1,7133 @@
+// ==UserScript==
+// @name         中国大学MOOC-自动化
+// @namespace    https://github.com/weiy02/ChinaMOOC-Auto
+// @version      2.1.3
+// @description  中国大学MOOC/SPOC学生互评自动化：解析真实分值选最高分，评语“科技改变生活”，答题者不可见。支持停止、评分修复；课堂讨论自动回复（适配新版UI与SPOC，含页面DOM诊断）；随堂测验一键作答并提交（MOOC走课件接口、SPOC走dwr取答案，逐题比对填涂，单选/多选/判断/填空都支持）；自动学习（新版DOM导航：tab内容标签+章节/小节下拉模拟点击，SPOC走unitslist+j-up下拉；随堂测验自动作答提交后停留10秒、单元测验/考试不进入、富文本停留10秒自动跳）：从当前内容开始→视频从头播放→完成后进入本章下一个内容（文档每页1秒自动翻页，含新版缩略图阅读器；讨论自动回复；已看完的视频不重播；视频中弹出的题目默认直接拦截：不放行暂停、浮层一出现就收掉，视频一路播到底，拦不住时才自动作答并提交、答案优先取课件接口）。面板为暗色简约风格，只留按钮；标题栏「?」打开完整功能说明。
+// @author       weiy02
+// @match        *://www.icourse163.org/*
+// @icon         https://www.google.com/s2/favicons?sz=64&domain=icourse163.org
+// @license      MIT
+// @supportURL   https://github.com/weiy02/ChinaMOOC-Auto/issues
+// @homepageURL  https://github.com/weiy02/ChinaMOOC-Auto
+// @downloadURL  https://raw.githubusercontent.com/weiy02/ChinaMOOC-Auto/main/main.js
+// @updateURL    https://raw.githubusercontent.com/weiy02/ChinaMOOC-Auto/main/main.js
+// @grant        none
+// @run-at       document-idle
+// ==/UserScript==
+
+(function () {
+    'use strict';
+
+    // ===================== 配置区 =====================
+    var CONFIG = {
+        COMMENT: '科技改变生活',
+        BATCH_COUNT: 6,
+        REVIEW_COUNT_MAX: 200,
+        DELAY_AFTER_SUBMIT: 2000,
+        DELAY_AFTER_CLICK: 300,
+        CANCEL_POLL_INTERVAL: 60,
+        FIX_MAX_LOOPS: 60,
+        FIX_PAGE_WAIT: 2500,
+        FIX_LIST_WAIT: 3000,
+
+        // ---- 课堂讨论自动回复 ----
+        // 回复正文的长度上限。别人的答复可能是长篇大论，整段照搬既显眼又容易
+        // 触发字数限制，超过就从句子边界截断。
+        DISCUSS_MAX_LEN: 200,
+        // 比这更短的正文不当作“答复”看待（多半是「已删除」「图片」之类的占位）
+        DISCUSS_MIN_LEN: 2,
+        // 单条讨论最多解析多少个答复，防止楼层上千时卡住
+        DISCUSS_MAX_ITEMS: 300,
+        // 已回复记录最多留多少条（按讨论标题 + 页面地址去重）
+        DISCUSS_HISTORY_MAX: 300,
+        // 填入编辑器后到点「发布」之间的等待，给富文本框架留出同步时间
+        DISCUSS_FILL_WAIT: 600,
+
+        // ---- 自动学习（新版学习页 #/learn/content?type=detail&id=xxx）----
+        LEARN_DOC_PAGE_MS: 1000,        // 文档每页停留 1 秒（用户要求）
+        LEARN_NAV_WAIT: 5000,           // 切换内容后的加载等待上限
+        LEARN_QUIZ_RESUME_WAIT: 8000,   // 提交视频弹题后，等待视频自动恢复播放的最长时间
+        LEARN_QUIZ_VISIT_MS: 2500,      // 非随堂测验（单元测验/作业/考试页）的兜底停留，很短，只为不硬跳
+        LEARN_OTHER_VISIT_MS: 10000,    // 富文本等其它内容停留 10 秒后自动跳转（用户要求）
+        LEARN_VIDEO_END_MARGIN: 1.5,    // 距视频结尾还剩多少秒视为“已看完”
+        LEARN_CONTENT_READY_WAIT: 15000, // 内容加载就绪的最大等待时间（修复“没加载完就跳转”）
+        LEARN_IDLE_POLL: 600,           // 视频监控轮询间隔（毫秒）
+        LEARN_MAX_PAGE_FLIPS: 600,      // 单个文档最多翻多少页（保险上限）
+        LEARN_MAX_ITEMS: 200,           // 单章最多处理多少内容（保险上限）
+
+        // ---- 随堂测验（自动学习）----
+        // 小节里那个「测试」就是随堂测验，不限次数、做完可以重做，所以自动学习时
+        // 直接作答并提交（MOOC / SPOC 一致）。单元测验、考试是独立页，永远不碰。
+        LEARN_AUTO_QUIZ: true,
+        // 随堂测验提交后停留多久再跳下一个内容（用户要求 10 秒）
+        LEARN_QUIZ_AFTER_MS: 10000,
+        // 判定「是不是随堂测验」时最多等多久让题块渲染出来。
+        // 刚切到「测试」标签时容器往往还是空的，立刻判会把随堂测验误判成
+        // 单元测验/考试而直接跳过（手动点按钮时页面早已加载完，所以不会复现）。
+        LEARN_QUIZ_READY_WAIT: 8000,
+        // 每次跳转后强制停留多久才开始处理新内容（用户要求 10 秒）。
+        // 页面刚切过去时 DOM 往往还是上一份内容，立即判定会误判类型，
+        // 甚至把“还没开始的内容”当成已完成而马上跳到下一节。
+        LEARN_JUMP_SETTLE_MS: 10000,
+        // 落点是「此前已经看完」的视频时，不必等满 10 秒。
+        // 平台对已完成视频常常约 5 秒就自动跳到下一集（而且是下一个视频，
+        // 中间的文档/测验/讨论直接被跨过去）。这里只留一个确认 DOM 的短窗口，
+        // 抢在平台自动跳转之前由脚本自己按内容条顺序前进。
+        LEARN_JUMP_SETTLE_FAST_MS: 1500,
+        // 连续视频是否跳过（1.14.x 的老行为：视频→视频 直接跳过第二个）。
+        // 默认 false：逐个处理才不会漏学；想回到老行为改成 true。
+        LEARN_SKIP_CONSECUTIVE_VIDEO: false,
+
+        // ---- 视频播放中的弹题 ----
+        // 首选方案：不让弹题打断播放。两层拦截——
+        //   1. 劫持 HTMLMediaElement.prototype.pause，弹题那一下暂停不真的执行；
+        //   2. MutationObserver 盯着新增节点，浮层一插进来就立刻隐藏掉。
+        // 视频因此能一播到底，不会卡在“答题才能继续”。
+        // 注意：这是前端拦截，平台若按“弹题通过数”结算进度，可能不计这一段。
+        // 出现这种情况把这个开关关掉，就会退回下面的自动作答。
+        LEARN_VIDEO_SKIP_POPUP: true,
+        // 兜底方案：拦截没成功（浮层反复出现、或它包着播放器没法隐藏）时，
+        // 自动选答案并提交。答案优先从课件接口里取，取不到才按顺位猜。
+        LEARN_VIDEO_ANSWER_POPUP: true,
+        // 拦截成功后的观察窗口：这段时间内视频仍停着，就认定拦截失败，转兜底作答
+        LEARN_VIDEO_GUARD_GRACE: 4000,
+    };
+
+    // 旧版评分修复的列表解析仍保留为内部兼容代码，面板不再提供入口。
+    var LIST_CONFIG = {
+        tableHints: /作业列表|你的评分|学生名|学号|提交时间/,
+        itemSelectors: ['.j-list .item', '.list-item', '.evaluate-list .item', '[class*="review-list"] [class*="item"]', '[class*="homework-list"] [class*="item"]', '[class*="evaluate-list"] [class*="item"]', '.m-list .item'],
+        scoreSelectors: ['.score', '.mark', '.fraction', '.grade', '[class*="score"]', '[class*="mark"]', '[class*="fraction"]'],
+        backText: /返回|返回列表|回到列表/,
+        completedText: /已完成|已评|已提交|修改互评|继续互评/,
+    };
+
+    // 页面路由特征。icourse163 是 hash 路由的单页应用，URL 会随导航变化，
+    // 因此每次判定都要重新读 location.href，不能只在启动时判定一次。
+    var PAGE_CONFIG = {
+        // 考试页：只能提交一次、可能有时限，风险最高，优先识别
+        examUrl: /examObject|examIndex|examPaper|\/learn\/exam/i,
+        // 答题页：测验 / 单元作业客观题 / 考试
+        quizUrl: /quizObject|quizIndex|testObject|\/learn\/quiz|\/learn\/test|homeworkObject|\/learn\/homework/i,
+    };
+
+    // ===================== 任务状态 =====================
+    var taskState = { running: false, cancelled: false };
+
+    function makeCancelError() {
+        var e = new Error('已停止');
+        e.__cancelled = true;
+        return e;
+    }
+
+    function sleep(ms) {
+        return new Promise(function (resolve, reject) {
+            var start = Date.now();
+            function tick() {
+                if (taskState.cancelled) { reject(makeCancelError()); return; }
+                if (Date.now() - start >= ms) { resolve(); return; }
+                setTimeout(tick, CONFIG.CANCEL_POLL_INTERVAL);
+            }
+            tick();
+        });
+    }
+
+    // 带提前退出的等待：early() 返回 true（如用户点了【下一节】）时立即结束
+    function sleepWhile(ms, early) {
+        return new Promise(function (resolve, reject) {
+            var start = Date.now();
+            function tick() {
+                if (taskState.cancelled) { reject(makeCancelError()); return; }
+                if (Date.now() - start >= ms || (typeof early === 'function' && early())) { resolve(); return; }
+                setTimeout(tick, 250);
+            }
+            tick();
+        });
+    }
+
+    async function waitFor(fn, timeoutMs, intervalMs) {
+        var start = Date.now();
+        var iv = intervalMs || 200;
+        while (Date.now() - start < timeoutMs) {
+            if (taskState.cancelled) throw makeCancelError();
+            try { if (fn()) return true; } catch (e) { /* ignore */ }
+            await sleep(iv);
+        }
+        return false;
+    }
+
+    // ===================== 基础工具 =====================
+    function isVisible(el) {
+        if (!el) return false;
+        var s = getComputedStyle(el);
+        if (s.display === 'none' || s.visibility === 'hidden' || parseFloat(s.opacity) < 0.05) return false;
+        if (el.offsetParent === null && s.position !== 'fixed') return false;
+        return true;
+    }
+
+    function realClick(el) {
+        if (!el) return;
+        var types = ['mousedown', 'mouseup', 'click'];
+        for (var i = 0; i < types.length; i++) {
+            el.dispatchEvent(new MouseEvent(types[i], { bubbles: true, cancelable: true, view: window }));
+        }
+    }
+
+    function setNativeValue(el, value) {
+        if (!el) return;
+        var proto = el.tagName === 'TEXTAREA'
+            ? window.HTMLTextAreaElement.prototype
+            : window.HTMLInputElement.prototype;
+        var descriptor = Object.getOwnPropertyDescriptor(proto, 'value');
+        var setter = descriptor ? descriptor.set : null;
+        if (setter) setter.call(el, value); else el.value = value;
+        el.dispatchEvent(new Event('input', { bubbles: true }));
+        el.dispatchEvent(new Event('change', { bubbles: true }));
+    }
+
+    // ===================== 本地存储 =====================
+    // 只有 localStorage 一条来源。读写都要吞掉异常：隐私模式下 localStorage
+    // 会直接抛，而存的是开关状态和回复留痕这类非关键数据，不能因为存不下就崩。
+    function readStore(key, fallback) {
+        try {
+            var raw = localStorage.getItem(key);
+            if (!raw) return fallback;
+            return JSON.parse(raw);
+        } catch (e) {
+            console.warn('[MOOC助手] 读取本地存储失败', key, e);
+            return fallback;
+        }
+    }
+
+    function writeStore(key, val) {
+        try {
+            localStorage.setItem(key, JSON.stringify(val));
+            return true;
+        } catch (e) {
+            console.warn('[MOOC助手] 写入本地存储失败', key, e);
+            return false;
+        }
+    }
+
+    // ===================== 解除复制限制 =====================
+    // 慕课的课件、字幕、题目普遍禁止选中与复制，手段通常是三类：
+    //   1. CSS：在 body 或内容容器上设 user-select: none
+    //   2. 事件：在 document/body 上挂 copy / cut / selectstart / contextmenu /
+    //      dragstart 的处理器，或直接给 on* 属性赋值并 return false
+    //   3. 键盘：拦截 Ctrl/⌘ + C / X / A 并 preventDefault
+    // 对应两种反制：
+    //   - 注入带 !important 的样式表。样式表里的 !important 优先于元素的行内样式，
+    //     所以即便站点用 JS 写 body.style.userSelect = 'none' 也压不过它。
+    //   - 在 window 的【捕获阶段】掐断事件传播。捕获阶段 window 早于 document，
+    //     所以比站点挂在 document 上的捕获监听还早。
+    //     关键是只掐传播、不调 preventDefault —— 浏览器的选中/复制/右键菜单等
+    //     默认行为必须保留，否则连正常功能一起取消掉了；而站点挂的拦截逻辑
+    //     收不到事件，自然也就拦不住。
+    var COPY_UNLOCK = {
+        STYLE_ID: 'mar-copy-unlock-style',
+        KEY: 'mar.copyUnlock',
+        EVENTS: ['copy', 'cut', 'paste', 'selectstart', 'contextmenu', 'dragstart'],
+    };
+
+    var copyUnlockBound = false;
+
+    function copyUnlockCss() {
+        return [
+            'html, body, body * {',
+            '  -webkit-user-select: text !important;',
+            '  -moz-user-select: text !important;',
+            '  -ms-user-select: text !important;',
+            '  user-select: text !important;',
+            '  -webkit-touch-callout: default !important;',
+            '}',
+            'img, a { -webkit-user-drag: auto !important; }',
+        ].join('\n');
+    }
+
+    function copyUnlockHandler(e) {
+        e.stopImmediatePropagation();
+    }
+
+    // 只拦「复制 / 剪切 / 全选」组合键。不这么收窄的话，在 window 捕获阶段
+    // 拦掉全部 keydown 会把站点的搜索框和快捷键一起弄坏。
+    function copyUnlockKeydown(e) {
+        var k = String(e.key || '').toLowerCase();
+        if ((e.ctrlKey || e.metaKey) && (k === 'c' || k === 'x' || k === 'a')) {
+            e.stopImmediatePropagation();
+        }
+    }
+
+    function isCopyUnlockOn() {
+        return readStore(COPY_UNLOCK.KEY, false) === true;
+    }
+
+    function applyCopyUnlock(on) {
+        var existing = document.getElementById(COPY_UNLOCK.STYLE_ID);
+        if (on) {
+            if (!existing) {
+                var style = document.createElement('style');
+                style.id = COPY_UNLOCK.STYLE_ID;
+                style.textContent = copyUnlockCss();
+                (document.head || document.documentElement).appendChild(style);
+            }
+            if (!copyUnlockBound) {
+                for (var i = 0; i < COPY_UNLOCK.EVENTS.length; i++) {
+                    window.addEventListener(COPY_UNLOCK.EVENTS[i], copyUnlockHandler, true);
+                }
+                window.addEventListener('keydown', copyUnlockKeydown, true);
+                copyUnlockBound = true;
+            }
+        } else {
+            if (existing && existing.parentNode) existing.parentNode.removeChild(existing);
+            if (copyUnlockBound) {
+                for (var j = 0; j < COPY_UNLOCK.EVENTS.length; j++) {
+                    window.removeEventListener(COPY_UNLOCK.EVENTS[j], copyUnlockHandler, true);
+                }
+                window.removeEventListener('keydown', copyUnlockKeydown, true);
+                copyUnlockBound = false;
+            }
+        }
+        writeStore(COPY_UNLOCK.KEY, !!on);
+    }
+
+    function updateCopyUnlockButton() {
+        var btn = document.getElementById('mar-copy-unlock');
+        if (!btn) return;
+        var on = isCopyUnlockOn();
+        btn.textContent = '解除复制限制：' + (on ? '开' : '关');
+        if (on) btn.classList.add('mar-on'); else btn.classList.remove('mar-on');
+    }
+
+    function toggleCopyUnlock() {
+        var next = !isCopyUnlockOn();
+        applyCopyUnlock(next);
+        updateCopyUnlockButton();
+        updateStatus(next
+            ? '🔓 已解除复制限制：可选中、可右键、Ctrl/⌘+C 可用'
+            : '🔒 已恢复页面原本的复制限制');
+    }
+
+    // ===================== 视频弹题拦截开关 =====================
+    // 默认跟 CONFIG.LEARN_VIDEO_SKIP_POPUP 走；用户手动切过一次，就以本地存的值为准。
+    // 之所以要留这个开关：拦截是纯前端动作，如果平台按「弹题通过数」结算学习进度，
+    // 关掉它退回「自动作答并提交」才是安全路径。
+    var POPUP_SKIP = { KEY: 'mar.popupSkip' };
+
+    function isPopupSkipOn() {
+        var v = readStore(POPUP_SKIP.KEY, null);
+        if (v === null || v === undefined) return !!CONFIG.LEARN_VIDEO_SKIP_POPUP;
+        return !!v;
+    }
+
+    function updatePopupSkipButton() {
+        var btn = document.getElementById('mar-popup-skip');
+        if (!btn) return;
+        var on = isPopupSkipOn();
+        btn.textContent = '视频弹题拦截：' + (on ? '开' : '关');
+        if (on) btn.classList.add('mar-on'); else btn.classList.remove('mar-on');
+    }
+
+    function togglePopupSkip() {
+        var next = !isPopupSkipOn();
+        writeStore(POPUP_SKIP.KEY, next);
+        updatePopupSkipButton();
+        updateStatus(next
+            ? '⏭ 已开启弹题拦截：视频不再被弹题打断，浮层一出现就收掉'
+            : '📝 已关闭弹题拦截：弹题正常出现，脚本自动选答案并提交');
+    }
+
+    function assertReviewListPage() {
+        var list = parseScoreList();
+        return !!(list && list.items.length > 0);
+    }
+
+    // ===================== 分值解析 =====================
+    function parseScoreFromText(text) {
+        if (!text) return null;
+        var m = text.match(/(\d+(?:\.\d+)?)\s*分/);
+        if (m) return parseFloat(m[1]);
+        m = text.match(/^(\d+(?:\.\d+)?)$/);
+        if (m) return parseFloat(m[1]);
+        m = text.match(/(\d+(?:\.\d+)?)/);
+        if (m) return parseFloat(m[1]);
+        return null;
+    }
+
+    function getScoreFromRadio(r) {
+        var lbl = r.closest('label');
+        if (!lbl && r.id) {
+            try { lbl = document.querySelector('label[for="' + CSS.escape(r.id) + '"]'); }
+            catch (e) { lbl = null; }
+        }
+        if (lbl) { var s1 = parseScoreFromText(lbl.textContent); if (s1 !== null && !isNaN(s1)) return s1; }
+        if (r.parentElement) { var s2 = parseScoreFromText(r.parentElement.textContent); if (s2 !== null && !isNaN(s2)) return s2; }
+        var attrs = ['data-score', 'data-value', 'data-val'];
+        for (var i = 0; i < attrs.length; i++) {
+            var v = r.getAttribute(attrs[i]);
+            if (v) { var n = parseFloat(v); if (!isNaN(n)) return n; }
+        }
+        if (r.value) { var nv = parseFloat(r.value); if (!isNaN(nv)) return nv; }
+        return null;
+    }
+
+    function getScoreFromElement(el) {
+        if (!el) return null;
+        var attrs = ['data-score', 'data-value', 'data-val'];
+        for (var i = 0; i < attrs.length; i++) {
+            var v = el.getAttribute ? el.getAttribute(attrs[i]) : null;
+            if (v) { var n = parseFloat(v); if (!isNaN(n)) return n; }
+        }
+        if (el.querySelector) {
+            var inner = el.querySelector('input');
+            if (inner && inner.value) { var ni = parseFloat(inner.value); if (!isNaN(ni)) return ni; }
+        }
+        var s1 = parseScoreFromText((el.textContent || '').trim());
+        if (s1 !== null && !isNaN(s1)) return s1;
+        if (el.parentElement) { var s2 = parseScoreFromText(el.parentElement.textContent || ''); if (s2 !== null && !isNaN(s2)) return s2; }
+        return null;
+    }
+
+    function selectRadio(r) {
+        realClick(r);
+        if (!r.checked) {
+            r.checked = true;
+            r.dispatchEvent(new Event('input', { bubbles: true }));
+            r.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+    }
+
+    // ===================== 提交按钮 / 完成判定 =====================
+    function getVisibleSubmitButton() {
+        var candidates = document.querySelectorAll('.j-submitbtn, .submit-btn, button[class*="submit"]');
+        for (var i = 0; i < candidates.length; i++) {
+            if (isVisible(candidates[i]) && !candidates[i].disabled) return candidates[i];
+        }
+        var allBtns = document.querySelectorAll('button, a, div[role="button"]');
+        for (var j = 0; j < allBtns.length; j++) {
+            if (!isVisible(allBtns[j]) || allBtns[j].disabled) continue;
+            var t = (allBtns[j].textContent || '').trim();
+            if (t === '提交' || t === '提交互评') return allBtns[j];
+        }
+        return null;
+    }
+
+    function isFinished() {
+        if (getVisibleSubmitButton()) return false;
+        if (document.querySelectorAll('input[type="radio"]').length > 0) return false;
+        return true;
+    }
+
+    // ===================== 评分主逻辑 =====================
+    async function rateCurrentAssignment() {
+        var rated = 0;
+
+        var allRadios = Array.prototype.slice.call(document.querySelectorAll('input[type="radio"]'));
+        if (allRadios.length > 0) {
+            var groups = new Map();
+            allRadios.forEach(function (r) {
+                var key = r.name || '__ungrouped__';
+                if (!groups.has(key)) groups.set(key, []);
+                groups.get(key).push(r);
+            });
+            var it = groups.values(), g = it.next();
+            while (!g.done) {
+                var group = g.value, best = null, bestScore = -Infinity;
+                for (var i = 0; i < group.length; i++) {
+                    var s = getScoreFromRadio(group[i]);
+                    if (s !== null && !isNaN(s) && s > bestScore) { bestScore = s; best = group[i]; }
+                }
+                if (!best && group.length > 0) best = group[group.length - 1];
+                if (best) { selectRadio(best); rated++; await sleep(CONFIG.DELAY_AFTER_CLICK); }
+                g = it.next();
+            }
+        }
+
+        if (rated === 0) {
+            var areas = Array.prototype.slice.call(document.querySelectorAll('.s'));
+            if (areas.length === 0) {
+                areas = Array.prototype.slice.call(document.querySelectorAll('[class*="score"], [class*="rating"]'));
+            }
+            if (areas.length === 0) return { success: false, error: '未找到评分区域，请确认已进入互评页面' };
+
+            for (var a = 0; a < areas.length; a++) {
+                var area = areas[a];
+                var options = Array.prototype.slice.call(area.querySelectorAll('label, .option, [role="radio"]'));
+                if (options.length === 0) {
+                    options = Array.prototype.slice.call(area.querySelectorAll('span, div'))
+                        .filter(function (el) { return el.children.length === 0 && /\d/.test(el.textContent || ''); });
+                }
+                options = options.filter(function (el) {
+                    return !options.some(function (other) { return other !== el && other.contains(el); });
+                });
+                var bestOpt = null, bestOptScore = -Infinity;
+                for (var k = 0; k < options.length; k++) {
+                    var os = getScoreFromElement(options[k]);
+                    if (os !== null && !isNaN(os) && os > bestOptScore) { bestOptScore = os; bestOpt = options[k]; }
+                }
+                if (!bestOpt && options.length > 0) bestOpt = options[options.length - 1];
+                if (bestOpt) { realClick(bestOpt); rated++; await sleep(CONFIG.DELAY_AFTER_CLICK); }
+            }
+        }
+
+        if (rated === 0) return { success: false, error: '未找到任何可评分选项' };
+
+        var textareas = document.querySelectorAll('textarea');
+        for (var t = 0; t < textareas.length; t++) {
+            if (isVisible(textareas[t])) {
+                setNativeValue(textareas[t], CONFIG.COMMENT);
+                await sleep(CONFIG.DELAY_AFTER_CLICK);
+            }
+        }
+
+        var checkboxes = document.querySelectorAll('input[type="checkbox"]');
+        for (var c = 0; c < checkboxes.length; c++) {
+            var cb = checkboxes[c];
+            var labelEl = cb.closest('label') || cb.parentElement;
+            var txt = labelEl ? (labelEl.textContent || '').trim() : '';
+            if (/可见|公开|visible/i.test(txt) && cb.checked) {
+                realClick(cb);
+                await sleep(CONFIG.DELAY_AFTER_CLICK);
+            }
+        }
+        return { success: true };
+    }
+
+    // ===================== 弹窗处理 =====================
+    async function dismissModal() {
+        await sleep(500);
+        var selectors = ['.u-dialog', '.m-dialog', '.u-popup', '.u-layer', '[class*="dialog"]', '[class*="modal"]'];
+        for (var s = 0; s < selectors.length; s++) {
+            var modals = document.querySelectorAll(selectors[s]);
+            for (var i = 0; i < modals.length; i++) {
+                if (!isVisible(modals[i])) continue;
+                var btns = modals[i].querySelectorAll('button, a, .u-btn, .m-btn');
+                for (var j = 0; j < btns.length; j++) {
+                    var t = (btns[j].textContent || '').trim();
+                    if (/^(确定|继续|知道了|关闭|好的)$/.test(t)) {
+                        realClick(btns[j]);
+                        await sleep(800);
+                        return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    // ===================== 提交 / 跳转 =====================
+    async function submitCurrent() {
+        var submitBtn = getVisibleSubmitButton();
+        if (!submitBtn) return { success: false, error: '未找到可见的提交按钮' };
+        realClick(submitBtn);
+        await sleep(CONFIG.DELAY_AFTER_SUBMIT);
+        await dismissModal();
+        return { success: true };
+    }
+
+    async function goToNext() {
+        var nextBtn = document.querySelector('.j-gotonext');
+        if (!nextBtn || !isVisible(nextBtn)) {
+            var allBtns = document.querySelectorAll('button, a, div[role="button"]');
+            for (var i = 0; i < allBtns.length; i++) {
+                if (!isVisible(allBtns[i])) continue;
+                if (/下一份|下一题|下一页/.test(allBtns[i].textContent || '')) { nextBtn = allBtns[i]; break; }
+            }
+        }
+        if (nextBtn && isVisible(nextBtn)) {
+            realClick(nextBtn);
+            await sleep(CONFIG.DELAY_AFTER_SUBMIT);
+            return true;
+        }
+        return false;
+    }
+
+    // ===================== 列表解析（支持表格结构） =====================
+    function findClickableInRow(row) {
+        // 1. 明确可点击元素
+        var candidates = row.querySelectorAll('a[href], button, [role="button"], [onclick]');
+        for (var i = 0; i < candidates.length; i++) {
+            var t = (candidates[i].textContent || '').trim();
+            if (/删除|举报|下载|查看答案/.test(t)) continue;
+            if (isVisible(candidates[i])) return candidates[i];
+        }
+        // 2. cursor:pointer 的叶子元素
+        var all = row.querySelectorAll('*');
+        for (var j = 0; j < all.length; j++) {
+            var el = all[j];
+            if (el.children.length > 0) continue;
+            try {
+                var cur = getComputedStyle(el).cursor;
+                if (cur === 'pointer' && isVisible(el)) return el;
+            } catch (e) { /* ignore */ }
+        }
+        // 3. 兜底：整行
+        return row;
+    }
+
+    function parseTableList() {
+        var containers = document.querySelectorAll(
+            'table, .m-table, .u-table, [class*="table-wrap"], [class*="list-table"], [class*="u-table"]'
+        );
+        for (var i = 0; i < containers.length; i++) {
+            var t = containers[i];
+            var head = (t.textContent || '').slice(0, 2000);
+            if (!LIST_CONFIG.tableHints.test(head)) continue;
+
+            var rows = t.querySelectorAll('tr, [role="row"], .row');
+            if (rows.length < 2) continue;
+
+            var items = [];
+            for (var j = 0; j < rows.length; j++) {
+                var row = rows[j];
+                var rowTxt = (row.textContent || '').trim();
+
+                if (row.querySelector('th, [role="columnheader"]')) continue;
+                if (/^作业列表|^你的评分|^学生名/.test(rowTxt)) continue;
+                if (rowTxt.length < 2) continue;
+
+                var cells = row.querySelectorAll('td, [role="cell"], .cell, .u-table-cell');
+                if (cells.length === 0) continue;
+
+                var score = null;
+                var lastText = (cells[cells.length - 1].textContent || '').trim();
+                score = parseScoreFromText(lastText);
+                if (score === null) {
+                    for (var k = cells.length - 1; k >= 0; k--) {
+                        var s = parseScoreFromText((cells[k].textContent || '').trim());
+                        if (s !== null) { score = s; break; }
+                    }
+                }
+
+                var completed = score !== null || /已完成|已评/.test(rowTxt);
+                var enterBtn = findClickableInRow(row);
+                var nameText = (cells[0].textContent || '').trim();
+
+                items.push({
+                    el: row,
+                    score: score,
+                    completed: completed,
+                    enterBtn: enterBtn,
+                    text: nameText,
+                });
+            }
+            if (items.length > 0) {
+                console.log('[MOOC互评] 表格检测到 ' + items.length + ' 条作业');
+                return { items: items };
+            }
+        }
+        return null;
+    }
+
+    function parseGenericItem(el) {
+        var score = null;
+        for (var i = 0; i < LIST_CONFIG.scoreSelectors.length; i++) {
+            var sEl = el.querySelector(LIST_CONFIG.scoreSelectors[i]);
+            if (sEl) {
+                var v = parseScoreFromText(sEl.textContent);
+                if (v !== null) { score = v; break; }
+            }
+        }
+        var text = el.textContent || '';
+        var completed = LIST_CONFIG.completedText.test(text) || score !== null;
+        var enterBtn = findClickableInRow(el);
+        return { el: el, score: score, completed: completed, enterBtn: enterBtn, text: text };
+    }
+
+    function parseScoreList() {
+        // 策略 1：表格结构
+        var tableResult = parseTableList();
+        if (tableResult && tableResult.items.length > 0) return tableResult;
+
+        // 策略 2：通用列表结构
+        for (var i = 0; i < LIST_CONFIG.itemSelectors.length; i++) {
+            var found = document.querySelectorAll(LIST_CONFIG.itemSelectors[i]);
+            if (found.length > 0) {
+                var items = Array.prototype.slice.call(found).map(parseGenericItem);
+                console.log('[MOOC互评] 通用选择器检测到 ' + items.length + ' 条作业');
+                return { items: items };
+            }
+        }
+        return null;
+    }
+
+    // ===================== 进入 / 返回 =====================
+    async function enterItem(item) {
+        if (!item || !item.enterBtn) return false;
+        var beforeUrl = location.href;
+        var beforeLen = document.body.innerHTML.length;
+        realClick(item.enterBtn);
+        await waitFor(function () {
+            return location.href !== beforeUrl ||
+                Math.abs(document.body.innerHTML.length - beforeLen) > 500;
+        }, CONFIG.FIX_PAGE_WAIT, 150);
+        await sleep(500);
+        return true;
+    }
+
+    async function returnToList() {
+        var allBtns = document.querySelectorAll('button, a, div[role="button"]');
+        for (var i = 0; i < allBtns.length; i++) {
+            var b = allBtns[i];
+            if (!isVisible(b)) continue;
+            var t = (b.textContent || '').trim();
+            if (LIST_CONFIG.backText.test(t) && t.length < 8) {
+                realClick(b);
+                await sleep(CONFIG.FIX_PAGE_WAIT);
+                return true;
+            }
+        }
+        try {
+            history.back();
+            await sleep(CONFIG.FIX_PAGE_WAIT);
+            return true;
+        } catch (e) {
+            return false;
+        }
+    }
+
+    // ===================== 评分修复主逻辑 =====================
+    async function scoreFix() {
+        if (!assertReviewListPage()) return;
+        updateStatus('📋 正在检测评分列表...');
+
+        var listData = parseScoreList();
+        if (!listData || listData.items.length === 0) {
+            updateStatus('❌ 未检测到评分列表，请先进入互评列表页面再运行');
+            return;
+        }
+        updateStatus('检测到 ' + listData.items.length + ' 份作业');
+
+        var completed = listData.items.filter(function (it) { return it.completed && it.score !== null; });
+
+        // 逻辑 1：没有已完成的评分作业
+        if (completed.length === 0) {
+            updateStatus('✅ 没有已完成的评分作业，无需修复');
+            return;
+        }
+
+        var maxScore = Math.max.apply(null, completed.map(function (it) { return it.score; }));
+        var notMax = completed.filter(function (it) { return it.score < maxScore; });
+
+        if (notMax.length === 0) {
+            // 逻辑 2：所有评分一致
+            updateStatus('所有评分一致（均 ' + maxScore + ' 分），随机进入一份验证...');
+            var pick = completed[Math.floor(Math.random() * completed.length)];
+            var ok = await enterAndRate(pick);
+            if (!ok) return;
+            await returnToList();
+            await sleep(CONFIG.FIX_LIST_WAIT);
+
+            var newList = parseScoreList();
+            if (!newList) { updateStatus('⚠️ 无法重新读取列表'); return; }
+            var newCompleted = newList.items.filter(function (it) { return it.completed && it.score !== null; });
+
+            if (newCompleted.length === 0) { updateStatus('✅ 修复完成（列表已刷新）'); return; }
+
+            var newMax = Math.max.apply(null, newCompleted.map(function (it) { return it.score; }));
+            var newNotMax = newCompleted.filter(function (it) { return it.score < newMax; });
+
+            if (newNotMax.length === 0) {
+                updateStatus('✅ 修复完成（所有评分均一致）');
+            } else {
+                updateStatus('⚠️ 验证后发现 ' + newNotMax.length + ' 份不一致，继续修复...');
+                await fixNotMaxLoop();
+            }
+        } else {
+            // 逻辑 3：存在不一致
+            updateStatus('⚠️ 检测到 ' + notMax.length + ' 份低于最高分（' + maxScore + '），开始修复...');
+            var pick2 = notMax[Math.floor(Math.random() * notMax.length)];
+            updateStatus('随机进入一份进行评分，作为满分标准...');
+            var ok2 = await enterAndRate(pick2);
+            if (!ok2) return;
+            await returnToList();
+            await sleep(CONFIG.FIX_LIST_WAIT);
+            await fixNotMaxLoop();
+        }
+    }
+
+    async function enterAndRate(item) {
+        if (!item || !item.enterBtn) {
+            updateStatus('❌ 该条目没有可用的进入按钮');
+            return false;
+        }
+        if (!await enterItem(item)) {
+            updateStatus('❌ 无法进入作业');
+            return false;
+        }
+        await sleep(1000);
+
+        var r = await rateCurrentAssignment();
+        if (!r.success) {
+            updateStatus('❌ 评分失败：' + r.error);
+            await returnToList();
+            return false;
+        }
+        var s = await submitCurrent();
+        if (!s.success) {
+            updateStatus('❌ 提交失败：' + s.error);
+            await returnToList();
+            return false;
+        }
+        return true;
+    }
+
+    async function fixNotMaxLoop() {
+        var loop = 0;
+        while (loop < CONFIG.FIX_MAX_LOOPS) {
+            loop++;
+            if (taskState.cancelled) throw makeCancelError();
+
+            var listData = parseScoreList();
+            if (!listData || listData.items.length === 0) {
+                updateStatus('⚠️ 无法读取列表，停止修复');
+                return;
+            }
+            var completed = listData.items.filter(function (it) { return it.completed && it.score !== null; });
+            if (completed.length === 0) { updateStatus('✅ 修复完成（无已完成作业）'); return; }
+
+            var maxScore = Math.max.apply(null, completed.map(function (it) { return it.score; }));
+            var notMax = completed.filter(function (it) { return it.score < maxScore; });
+
+            if (notMax.length === 0) {
+                updateStatus('✅ 修复完成（共 ' + loop + ' 次修复，所有评分一致）');
+                return;
+            }
+
+            updateStatus('修复中... 剩余 ' + notMax.length + ' 份 (第 ' + loop + ' 次)');
+            var item = notMax[0];
+
+            var ok = await enterAndRate(item);
+            if (!ok) { updateStatus('⚠️ 修复中途失败，已停止'); return; }
+            await returnToList();
+            await sleep(CONFIG.FIX_LIST_WAIT);
+        }
+        updateStatus('⚠️ 达到安全上限 ' + CONFIG.FIX_MAX_LOOPS + ' 次，停止修复');
+    }
+
+    // ===================== 按份数互评 =====================
+    async function batchReview(count) {
+        var success = 0;
+        while (success < count) {
+            if (isFinished()) { updateStatus('已完成 ' + success + ' 份，无更多作业可评'); return; }
+            updateStatus('正在互评第 ' + (success + 1) + '/' + count + ' 份...');
+            var r = await rateCurrentAssignment();
+            if (!r.success) { updateStatus('第 ' + (success + 1) + ' 份评分失败：' + r.error); return; }
+            var s = await submitCurrent();
+            if (!s.success) { updateStatus('第 ' + (success + 1) + ' 份提交失败：' + s.error); return; }
+            success++;
+            if (success >= count) break;
+            var moved = await goToNext();
+            if (!moved) {
+                await sleep(1500);
+                if (!getVisibleSubmitButton()) { updateStatus('已完成 ' + success + ' 份（无更多作业）'); return; }
+            }
+        }
+        updateStatus('快速互评完成，共 ' + success + ' 份 ✓');
+    }
+
+    // ===================== 互评份数按钮 =====================
+    // 按钮列表存在本地：默认 6 份可删除，自定义入口始终保留。
+    var REVIEW_COUNTS_KEY = 'mar.reviewCounts';
+
+    function reviewCounts() {
+        var raw = readStore(REVIEW_COUNTS_KEY, [CONFIG.BATCH_COUNT]);
+        if (!Array.isArray(raw)) raw = [CONFIG.BATCH_COUNT];
+        var seen = {};
+        return raw.map(function (v) { return parseInt(v, 10); }).filter(function (v) {
+            if (!isFinite(v) || v < 1 || v > CONFIG.REVIEW_COUNT_MAX || seen[v]) return false;
+            seen[v] = true;
+            return true;
+        });
+    }
+
+    function saveReviewCounts(counts) {
+        writeStore(REVIEW_COUNTS_KEY, counts);
+    }
+
+    // ===================== 课堂讨论：自动回复 =====================
+    // 从「已经有人回复过的区域」里挑一条现成答复作为回复正文。
+    // 两种来源：最新的一条 / 点赞最多的一条，默认最新，可在「设置」里切换。
+    //
+    // 与互评同一套安全原则：
+    //   1. 选不出正文就什么都不做——绝不拿占位文本凑数，也绝不自己编内容
+    //   2. 讨论允许重复回复；本地留痕只用于日志追溯，不再用来拦人
+    //   3. 只写「回复输入框」，不碰页面上其它可编辑区
+    //   4. 提供预览，先让人看见要发出去的是什么，再决定发不发
+    var DISCUSS = {
+        KEY_SOURCE: 'mar.discuss.source',
+        KEY_HISTORY: 'mar.discuss.history',
+
+        SOURCE_LATEST: 'latest',
+        SOURCE_LIKED: 'liked',
+
+        // 已回复区域的容器：命中任一且能解析出答复就采用，数组顺序即优先级
+        listSelectors: [
+            '[class*="reply-list"]', '[class*="replyList"]', '[class*="reply_list"]',
+            '[class*="comment-list"]', '[class*="commentList"]', '[class*="comment_list"]',
+            '[class*="post-list"]', '[class*="postList"]',
+            '[class*="answer-list"]', '[class*="answerList"]',
+            '[class*="discuss-list"]', '[class*="discussion-list"]',
+            '[class*="forum-list"]', '[class*="reply-area"]', '[class*="replyArea"]',
+            '[class*="comment-area"]', '[class*="topic-reply"]',
+            '.j-replyList', '.m-replyList', '.j-commentList', '.m-commentList',
+            '.j-comment-list', '.reply-list', '.comment-list', '.j-comment-list-wrapper',
+            '.replies-wrapper', '[class*="replies"]', '[class*="topic-replies"]',
+            // 新版论坛（tailwind 类名，楼层是 <article class="soft-shell p-5">）
+            // 动作栏 forum-reply-actions 也含 "forum"，要排掉
+            '[class*="forum"]:not([class*="actions"])',
+            // 新版 UI（mooc- 前缀，BEM 命名）
+            '[class*="mooc-comment"]', '[class*="mooc-discuss"]', '[class*="mooc-reply"]',
+            '[class*="mooc-comment__list"]', '[class*="mooc-discuss__list"]', '[class*="mooc-reply__list"]',
+            // SPOC（.m-data-lists 下每个直接子 div 是一条回复）
+            '.m-data-lists', '[class*="m-data-lists"]',
+        ],
+
+        // 容器之内的楼层节点
+        itemSelectors: [
+            '[class*="reply-item"]', '[class*="replyItem"]',
+            '[class*="comment-item"]', '[class*="commentItem"]',
+            '[class*="post-item"]', '[class*="postItem"]',
+            '[class*="answer-item"]', '[class*="answerItem"]',
+            '[class*="discuss-item"]', '[class*="discussion-item"]',
+            '[class*="floor"]', '[class*="reply-card"]', '[class*="replyCard"]',
+            // 新版论坛：一条回复就是一个 article（软卡片），
+            // 动作栏 forum-reply-actions 也在里面，靠 noiseZone 排除
+            'article', '.soft-shell',
+            '.j-reply-item', '.reply-item', '.j-comment-item', '.reply-container', '.reply-main',
+            // 新版 UI
+            '[class*="mooc-comment__item"]', '[class*="mooc-discuss__item"]', '[class*="mooc-reply__item"]',
+            '[class*="mooc-comment-item"]', '[class*="mooc-discuss-item"]', '[class*="mooc-reply-item"]',
+            // SPOC：正文节点本身就是一条回复
+            '.f-richEditorText', '[class*="f-richEditorText"]',
+            'li', '.item',
+        ],
+
+        // 楼层里的正文节点，按顺序优先（越靠前越像“正文”本身）
+        contentSelectors: [
+            '[class*="reply-content"]', '[class*="replyContent"]',
+            '[class*="comment-content"]', '[class*="commentContent"]',
+            '[class*="post-content"]', '[class*="postContent"]',
+            '[class*="answer-content"]', '[class*="answerContent"]',
+            '[class*="reply-text"]', '[class*="comment-text"]', '[class*="post-text"]',
+            '[class*="content"]', '[class*="text"]', '[class*="body"]', '[class*="desc"]',
+            '.reply-content', '.j-reply-content', '.j-topic-content', '.topic-content',
+            '[class*="article-content"]',
+            // 新版 UI
+            '[class*="mooc-comment__content"]', '[class*="mooc-discuss__content"]', '[class*="mooc-reply__content"]',
+            '[class*="mooc-comment__text"]', '[class*="mooc-comment-content"]',
+            // SPOC：富文本正文
+            '.f-richEditorText', '[class*="f-richEditorText"]',
+            'p',
+        ],
+
+        // 点赞数所在节点
+        likeSelectors: [
+            '[class*="like"]', '[class*="praise"]', '[class*="thumb"]',
+            '[class*="vote"]', '[class*="agree"]', '[class*="zan"]', '[class*="up-count"]',
+            '.j-icon-up', '.u-icon-vote', '.j-num',
+            '[class*="mooc-comment__like"]', '[class*="mooc-comment__vote"]', '[class*="mooc-like"]', '[class*="mooc-vote"]',
+            // 新版论坛：赞/踩包在 [data-forum-vote] 里，按钮带 aria-label
+            '[data-forum-vote]', '[aria-label="赞同"]', '[aria-label="赞"]',
+        ],
+
+        // 时间所在节点
+        timeSelectors: [
+            'time', '[class*="time"]', '[class*="date"]', '[class*="create"]', '[class*="publish"]',
+            '.reply-item-info', '[class*="replyInfo"]',
+        ],
+
+        // 动作栏 / 元信息区：整块都不是正文。
+        // 新版论坛把「昵称 + 时间 + 赞踩 + 评论 + 举报」全塞在
+        // <div class="forum-reply-actions"> 里，而它和正文用的是同一套
+        // tailwind 类名（text-sm / text-neutral-700），只看类名分不开，
+        // 只能按「区块」整体排除。
+        noiseZoneSelectors: [
+            '[class*="actions"]', '[class*="action-bar"]', '[class*="actionbar"]',
+            '[class*="meta"]', '[class*="footer"]', '[class*="toolbar"]',
+            '[class*="operat"]', '[data-forum-vote]',
+        ],
+
+        // 编辑器所在作用域：先在这些容器里找输入框，找不到才看整页
+        editorScopeSelectors: [
+            '[class*="reply-editor"]', '[class*="replyEditor"]', '[class*="reply-input"]',
+            '[class*="comment-editor"]', '[class*="comment-input"]', '[class*="post-editor"]',
+            '[class*="editor"]', '[class*="reply-box"]', '[class*="replyBox"]',
+            '[class*="comment-box"]', '[class*="reply-area"]', '[class*="replyArea"]',
+            '[class*="discuss"]', '[class*="forum"]', 'form',
+            '.j-editor-wrapper', '[class*="editor-textarea"]', '.editor-textarea', '.reply-editor',
+            // 新版 UI
+            '[class*="mooc-comment"]', '[class*="mooc-discuss"]', '[class*="mooc-reply"]',
+            '[class*="mooc-comment__editor"]', '[class*="mooc-comment__input"]', '[class*="mooc-comment__submit"]',
+        ],
+
+        // 发布按钮：整串相等才算，避免误点到楼层的「回复」小链接
+        submitText: /^(发布|发表|回复|提交|发送|评论|发表回复|发布回复|提交回复|提交答案|发表评论|发布评论|确定)$/,
+        // 输入框里的占位提示。看到这类文本要当成“空的”，可以直接覆盖
+        placeholderText: /请输入|说点什么|写下|来说两句|回复一下|发表你的|添加回复|写回复|期待你的|分享你的/,
+        // 元信息节点（作者名 / 时间 / 点赞条），正文提取时要避开
+        metaClass: /name|author|user|avatar|nick|time|date|like|praise|vote|agree|tool|oper|action/i,
+
+        // 作者昵称所在节点。只用来「认出这串字是作者名」，不参与正文拼装。
+        authorSelectors: [
+            // 新版论坛：昵称是 <a href="/mooc/learn/xxx/forum/personal?tid=..&uid=..">
+            // 类名全是 tailwind 的 hover: 样式，只能靠 href 认
+            'a[href*="forum/personal"]', 'a[href*="uid="]', '[data-forum-user]',
+            '[class*="author"]', '[class*="nick"]', '[class*="avatar"]',
+            '[class*="user-name"]', '[class*="userName"]', '[class*="username"]',
+            '[class*="user"] [class*="name"]', '[class*="user"]',
+            '.f-fl', 'a',
+        ],
+
+        // 要从正文里剔掉的元信息片段：昵称 / 时间 / 点赞数 / 楼层号。
+        // 特意不含 tool|oper|action——那多是「回复」「举报」按钮，会误伤正文。
+        noiseClass: /author|avatar|nick|user-name|username|userName|time|date|like|praise|vote|agree/i,
+    };
+
+    function getDiscussSource() {
+        var v = readStore(DISCUSS.KEY_SOURCE, DISCUSS.SOURCE_LATEST);
+        return (v === DISCUSS.SOURCE_LIKED) ? DISCUSS.SOURCE_LIKED : DISCUSS.SOURCE_LATEST;
+    }
+
+    function setDiscussSource(v) {
+        writeStore(DISCUSS.KEY_SOURCE, v === DISCUSS.SOURCE_LIKED ? DISCUSS.SOURCE_LIKED : DISCUSS.SOURCE_LATEST);
+        updateSourceSeg();
+    }
+
+    function sourceLabel(v) {
+        return v === DISCUSS.SOURCE_LIKED ? '点赞最多' : '最新答复';
+    }
+
+    // ===================== 课堂讨论：解析已回复区域 =====================
+    // 多选择器取并集并按数组顺序去重。单个选择器经常只能覆盖一种版式，
+    // 全站还有好几套模板，所以是「并集 + 优先级」而不是「命中一个就走」。
+    function collectCandidates(scope, selectors, limit) {
+        var out = [], seen = [];
+        for (var s = 0; s < selectors.length && out.length < limit; s++) {
+            var found;
+            try { found = scope.querySelectorAll(selectors[s]); } catch (e) { continue; }
+            for (var i = 0; i < found.length && out.length < limit; i++) {
+                if (seen.indexOf(found[i]) !== -1) continue;
+                seen.push(found[i]);
+                out.push(found[i]);
+            }
+        }
+        return out;
+    }
+
+    // 只保留最外层：楼层里嵌套的子回复会被反复统计，也会让正文串成一大坨
+    function keepOutermost(els) {
+        return els.filter(function (el) {
+            for (var i = 0; i < els.length; i++) {
+                if (els[i] !== el && els[i].contains(el)) return false;
+            }
+            return true;
+        });
+    }
+
+    function cleanText(s) {
+        return String(s === null || s === undefined ? '' : s).replace(/\s+/g, ' ').trim();
+    }
+
+    function isPlaceholderText(t) {
+        return !t || DISCUSS.placeholderText.test(t);
+    }
+
+    function firstNumberInText(text) {
+        var m = String(text || '').match(/\d+/);
+        return m ? parseInt(m[0], 10) : null;
+    }
+
+    function readAttrNumber(el, attrs) {
+        for (var i = 0; i < attrs.length; i++) {
+            var v = el.getAttribute ? el.getAttribute(attrs[i]) : null;
+            if (!v) continue;
+            var n = parseFloat(v);
+            if (!isNaN(n)) return n;
+        }
+        return null;
+    }
+
+    // 楼层里的点赞数。取「属性优先、文本兜底、多条取最大」，
+    // 认不出来时返回 null（而不是 0），好让上层区分「0 个赞」和「没解析到」。
+    function readLikeCount(item) {
+        // 新版论坛：赞数就是「赞同」按钮的文本，比按类名猜可靠得多
+        var agree = null;
+        try { agree = item.querySelector('[aria-label="赞同"], [aria-label="赞"]'); } catch (e) { agree = null; }
+        if (agree) {
+            var agreeN = firstNumberInText(agree.textContent);
+            if (agreeN !== null) return agreeN;
+        }
+        var els = collectCandidates(item, DISCUSS.likeSelectors, 30);
+        var best = null;
+        for (var i = 0; i < els.length; i++) {
+            var n = readAttrNumber(els[i], ['data-count', 'data-num', 'data-number', 'data-like', 'data-praise', 'data-total']);
+            if (n === null) n = readAttrNumber(els[i], ['title', 'aria-label']);
+            if (n === null) n = firstNumberInText(els[i].textContent);
+            if (n === null || isNaN(n)) continue;
+            if (best === null || n > best) best = n;
+        }
+        return best;
+    }
+
+    // 时间只用于排序，解析不出来返回 null，上层会退化成按页面顺序排
+    function parseTimeToMs(text) {
+        var s = cleanText(text);
+        if (!s) return null;
+        var now = Date.now(), m;
+
+        m = s.match(/(20\d{2})[-/.年](\d{1,2})[-/.月](\d{1,2})日?(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?/);
+        if (m) {
+            return new Date(parseInt(m[1], 10), parseInt(m[2], 10) - 1, parseInt(m[3], 10),
+                parseInt(m[4] || 0, 10), parseInt(m[5] || 0, 10), parseInt(m[6] || 0, 10)).getTime();
+        }
+        m = s.match(/(\d{1,2})[-/](\d{1,2})(?:[ T](\d{1,2}):(\d{2}))?/);
+        if (m) {
+            var mo = parseInt(m[1], 10), d = parseInt(m[2], 10);
+            if (mo >= 1 && mo <= 12 && d >= 1 && d <= 31) {
+                var dt = new Date(new Date().getFullYear(), mo - 1, d,
+                    parseInt(m[3] || 0, 10), parseInt(m[4] || 0, 10));
+                // 落在未来一年以上说明是去年的贴子，往回拨一年
+                if (dt.getTime() > now + 86400000) dt.setFullYear(dt.getFullYear() - 1);
+                return dt.getTime();
+            }
+        }
+        m = s.match(/(\d+)\s*(秒|分钟|分|小时|天|周|个月|月)前/);
+        if (m) {
+            var unit = { '秒': 1000, '分钟': 60000, '分': 60000, '小时': 3600000, '天': 86400000, '周': 604800000, '个月': 2592000000, '月': 2592000000 };
+            return now - parseInt(m[1], 10) * (unit[m[2]] || 0);
+        }
+        if (/刚刚|刚才/.test(s)) return now;
+        if (/昨天/.test(s)) return now - 86400000;
+        if (/前天/.test(s)) return now - 2 * 86400000;
+        return null;
+    }
+
+    function readTimeInfo(item) {
+        var els = collectCandidates(item, DISCUSS.timeSelectors, 20);
+        var firstText = '';
+        for (var i = 0; i < els.length; i++) {
+            var attr = els[i].getAttribute ? els[i].getAttribute('datetime') : null;
+            if (attr) {
+                var fromAttr = parseTimeToMs(attr);
+                if (fromAttr !== null) return { text: cleanText(els[i].textContent) || attr, ts: fromAttr };
+            }
+            var t = cleanText(els[i].textContent);
+            if (!t) continue;
+            if (!firstText) firstText = t;
+            var ts = parseTimeToMs(t);
+            if (ts !== null) return { text: t, ts: ts };
+        }
+        // 新版论坛把时间放在 <span class="text-xs text-neutral-400"> 里，
+        // 类名里既没有 time 也没有 date，只能按文本形态认。
+        var all, k;
+        try { all = item.querySelectorAll('span, a, div, p, time, small, em'); } catch (e) { all = []; }
+        for (k = 0; k < all.length && k < 80; k++) {
+            var tx = cleanText(all[k].textContent);
+            if (!tx || tx.length > 30) continue;
+            if (!/20\d{2}\s*[年/.-]|\d{1,2}月\d{1,2}日|刚刚|分钟前|小时前|昨天/.test(tx)) continue;
+            var tms = parseTimeToMs(tx);
+            if (tms !== null) return { text: tx, ts: tms };
+        }
+        return { text: firstText, ts: null };
+    }
+
+    // 正文节点判定：作者名 / 时间 / 点赞条这些元信息不是正文，
+    // 误取它们会把「张三 2026-10-11 12」当回复发出去。
+    function looksLikeMeta(el) {
+        var cls = (typeof el.className === 'string') ? el.className : '';
+        if (DISCUSS.metaClass.test(cls)) return true;
+        return !!(el.closest && el.closest('time, [class*="time"], [class*="like"], [class*="praise"]'));
+    }
+
+    // 节点是否落在动作栏 / 元信息区里（昵称、时间、赞踩、举报都在那里）。
+    // root 自己命中这类类名时不算——否则整个楼层被判成动作栏就没得解析了。
+    function inNoiseZone(node, root) {
+        if (!node || !node.closest) return false;
+        for (var i = 0; i < DISCUSS.noiseZoneSelectors.length; i++) {
+            var z;
+            try { z = node.closest(DISCUSS.noiseZoneSelectors[i]); } catch (e) { continue; }
+            if (z && z !== root) return true;
+        }
+        return false;
+    }
+
+    // 去掉动作栏之后的整层文本。新版论坛的 textContent 是
+    // 「正文 + 昵称 + 时间 + 0 0 评论(0) 举报」拼起来的，
+    // 挨个片段剥容易卡在纯数字上，直接克隆一份把动作栏整块摘掉最干净。
+    function textWithoutMeta(el) {
+        var clone;
+        try { clone = el.cloneNode(true); } catch (e) { return cleanText(el.textContent); }
+        var sels = DISCUSS.noiseZoneSelectors.join(',');
+        var junk;
+        try { junk = clone.querySelectorAll(sels); } catch (e) { junk = []; }
+        for (var i = 0; i < junk.length; i++) {
+            if (junk[i].parentNode) junk[i].parentNode.removeChild(junk[i]);
+        }
+        return cleanText(clone.textContent);
+    }
+
+    // 楼层里的元信息文本（昵称、头像替代文字、时间、点赞数）。
+    // 正文提取后要把这些片段从文本里剥掉——整层兜底时 textContent 是
+    // 「昵称 时间 正文」拼在一起的，直接发出去就成了回复别人的昵称。
+    function collectMetaTexts(item) {
+        var out = [];
+        var nodes = [];
+        try { nodes = item.querySelectorAll('*'); } catch (e) { return out; }
+        for (var i = 0; i < nodes.length; i++) {
+            var el = nodes[i];
+            var tag = String(el.tagName || '').toUpperCase();
+            var cls = (typeof el.className === 'string') ? el.className : '';
+            var isMeta = tag === 'TIME' || tag === 'IMG' || tag === 'SVG' || tag === 'I'
+                || DISCUSS.noiseClass.test(cls)
+                || /^(name|u-name|user-name|username|nick-name)$/i.test(cls)
+                || inNoiseZone(el, item);
+            if (!isMeta) continue;
+            var t = cleanText(el.textContent);
+            if (!t || t.length > 30) continue;          // 太长的多半是包裹层，不是元信息
+            if (out.indexOf(t) === -1) out.push(t);
+        }
+        return out;
+    }
+
+    // 从文本里剥掉落在开头 / 结尾的元信息片段。
+    // 只剥首尾，不动中间——正文里出现「张三」是正常的，删掉反而改错了内容。
+    function stripMetaText(text, metas) {
+        var t = cleanText(text);
+        var pass = 0, changed = true;
+        while (changed && pass++ < 10) {
+            changed = false;
+            for (var i = 0; i < metas.length && t; i++) {
+                var m = cleanText(metas[i]);
+                if (!m || m.length > 30) continue;
+                if (/^\d+$/.test(m)) continue;          // 点赞数 / 楼层号是纯数字，剥了容易误伤正文
+                if (t === m) { t = ''; changed = true; break; }
+                if (t.indexOf(m) === 0) { t = cleanText(t.slice(m.length)); changed = true; break; }
+                if (t.length > m.length && t.slice(t.length - m.length) === m) {
+                    t = cleanText(t.slice(0, t.length - m.length));
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        return cleanText(t.replace(/^[：:，,、·•\-\u200b\s]+/, ''));
+    }
+
+    // 认作者昵称。只用于「这串字是昵称」的判断和预览展示，不参与正文。
+    function readAuthor(item) {
+        for (var s = 0; s < DISCUSS.authorSelectors.length; s++) {
+            var hit;
+            try { hit = item.querySelectorAll(DISCUSS.authorSelectors[s]); } catch (e) { continue; }
+            for (var i = 0; i < hit.length; i++) {
+                var t = cleanText(hit[i].textContent);
+                if (!t || t.length > 30) continue;
+                if (/^\d+$/.test(t)) continue;               // 楼层号、纯数字学号
+                if (/^\d{4}\s*[-/.年]\s*\d{1,2}/.test(t)) continue; // 日期
+                if (isPlaceholderText(t)) continue;
+                // 新版的昵称是「312420030212软件2402王千硕」——学号打头，
+                // 所以不能一看到数字开头就排除，能读出中文/字母就算昵称
+                if (!/[\u4e00-\u9fa5a-zA-Z]/.test(t)) continue;
+                return t;
+            }
+        }
+        return '';
+    }
+
+    function pickContent(el) {
+        var metas = collectMetaTexts(el);
+        var author = readAuthor(el);
+        var cands = collectCandidates(el, DISCUSS.contentSelectors, 40);
+        var viable = [], i, s;
+
+        for (i = 0; i < cands.length; i++) {
+            // 动作栏里的 p / span 也是 text-sm、也够长，必须按区块挡掉，
+            // 否则命中的就是「昵称 + 时间」那一条
+            if (inNoiseZone(cands[i], el)) continue;
+            if (looksLikeMeta(cands[i])) continue;
+            var raw = cleanText(cands[i].textContent);
+            if (!raw || raw.length > 1500) continue;
+            if (isPlaceholderText(raw)) continue;
+            var t = stripMetaText(raw, metas);
+            if (t.length < CONFIG.DISCUSS_MIN_LEN) continue;  // 剥完还没昵称长，就不是正文
+            if (isPlaceholderText(t)) continue;
+            if (author && t === author) continue;             // 候选就是昵称本身
+            viable.push(t);
+        }
+
+        if (viable.length > 0) {
+            // 取最长的：同一层里可能有摘要、折叠态之类的短副本
+            var best = viable[0];
+            for (s = 1; s < viable.length; s++) {
+                if (viable[s].length > best.length) best = viable[s];
+            }
+            return { text: best, viaContent: true, author: author };
+        }
+
+        // 没有正文型子节点：退到整层文本，但先把动作栏整块摘掉，
+        // 再剥首尾元信息——否则发出去的就是一句「张三 2026-10-31 23:48」。
+        var selfText = stripMetaText(textWithoutMeta(el), metas);
+        if (selfText.length >= CONFIG.DISCUSS_MIN_LEN && selfText.length <= 1500
+            && !isPlaceholderText(selfText) && (!author || selfText !== author)) {
+            return { text: selfText, viaContent: false, author: author };
+        }
+        return null;
+    }
+
+    // 单条楼层 → 结构化记录。strict 时要求必须命中正文节点（整页兜底模式用，
+    // 否则满屏的 li 都会被当成回复）
+    function parseReplyItem(el, index, strict) {
+        var content = pickContent(el);
+        if (!content) return null;
+        if (strict && !content.viaContent) return null;
+        var time = readTimeInfo(el);
+        return {
+            el: el,
+            index: index,
+            text: content.text,
+            author: content.author || '',
+            likes: readLikeCount(el),
+            timeText: time.text,
+            ts: time.ts,
+            viaContent: content.viaContent,
+        };
+    }
+
+    function parseReplyItems() {
+        var lists = collectCandidates(document, DISCUSS.listSelectors, 40);
+        var i, items;
+        // 取「解析出的条数最多」的容器，而不是第一个成功的：
+        // 新版论坛里 forum-* 的包裹层有很多，先命中的可能只是某条回复的卡片，
+        // 只认第一个会漏掉同页其余楼层。
+        var best = null;
+        for (i = 0; i < lists.length; i++) {
+            var raw = keepOutermost(collectCandidates(lists[i], DISCUSS.itemSelectors, CONFIG.DISCUSS_MAX_ITEMS));
+            items = [];
+            for (var j = 0; j < raw.length; j++) {
+                var it = parseReplyItem(raw[j], items.length, false);
+                if (it) items.push(it);
+            }
+            if (items.length > 0 && (!best || items.length > best.items.length)) {
+                var cls = typeof lists[i].className === 'string' ? lists[i].className : '';
+                best = { items: items, listEl: lists[i], viaList: true, cls: cls };
+                if (items.length >= 8) break;   // 已经够多，不必再试后面的容器
+            }
+        }
+        if (best) {
+            console.log('[MOOC讨论] 命中容器 ' + best.cls + '，解析到 ' + best.items.length + ' 条答复');
+            return best;
+        }
+        // 容器全没命中：整页兜底，此时必须命中正文节点才算数
+        var fallback = keepOutermost(collectCandidates(document, DISCUSS.itemSelectors, CONFIG.DISCUSS_MAX_ITEMS));
+        items = [];
+        for (i = 0; i < fallback.length; i++) {
+            var f = parseReplyItem(fallback[i], items.length, true);
+            if (f) items.push(f);
+        }
+        if (items.length > 0) {
+            console.log('[MOOC讨论] 未命中已知容器，整页兜底解析到 ' + items.length + ' 条答复');
+        }
+        // 最后一招：按“点赞/投票元素”反查楼层。新版 UI 若改了楼层类名，
+        // 只要点赞图标还在，就能兜住大部分版式。
+        if (items.length === 0) {
+            var votes = document.querySelectorAll('[class*="vote"], [class*="like"], [class*="zan"], [class*="praise"], [class*="thumb"], .j-icon-up');
+            var seenFloor = [];
+            for (i = 0; i < votes.length && items.length < CONFIG.DISCUSS_MAX_ITEMS; i++) {
+                if (!isVisible(votes[i])) continue;
+                // 先找 article / 明确的楼层节点，最后才退到「任意含 reply 的容器」。
+                // 新版论坛的动作栏叫 forum-reply-actions，含 "reply" 也含 "actions"，
+                // 按老逻辑会把它当楼层，解析出来的正文就成了「昵称 + 时间」。
+                var floor = null;
+                if (votes[i].closest) {
+                    floor = votes[i].closest('article, li')
+                        || votes[i].closest('[class*="reply-item"], [class*="comment-item"], [class*="post-item"], [class*="floor"], [class*="reply-card"]')
+                        || votes[i].closest('[class*="reply"], [class*="comment"], [class*="post"], [class*="discuss"]');
+                }
+                if (!floor || seenFloor.indexOf(floor) !== -1) continue;
+                // 命中的是动作栏本身（而不是楼层）就直接跳过
+                var floorCls = typeof floor.className === 'string' ? floor.className : '';
+                if (/actions|toolbar|meta|footer/i.test(floorCls)) continue;
+                var it = parseReplyItem(floor, items.length, true);
+                if (it) { seenFloor.push(floor); items.push(it); }
+            }
+            if (items.length > 0) {
+                console.log('[MOOC讨论] 点赞元素反查楼层，解析到 ' + items.length + ' 条答复');
+            }
+        }
+        return { items: items, listEl: null, viaList: false };
+    }
+
+    // 按来源挑一条。返回 note 说明是怎么挑的，方便人对着预览判断靠不靠谱。
+    function pickSourceReply(items, source) {
+        if (!items || items.length === 0) return null;
+
+        function byNewest(a, b) {
+            var ta = a.ts === null ? -Infinity : a.ts;
+            var tb = b.ts === null ? -Infinity : b.ts;
+            if (ta !== tb) return tb - ta;
+            return b.index - a.index;
+        }
+
+        if (source === DISCUSS.SOURCE_LIKED) {
+            var liked = items.filter(function (it) { return it.likes !== null && it.likes > 0; });
+            if (liked.length === 0) {
+                var fb = items.slice().sort(byNewest)[0];
+                return {
+                    item: fb,
+                    note: '本页没解析到点赞数，已退回「最新答复」'
+                };
+            }
+            liked.sort(function (a, b) {
+                if (b.likes !== a.likes) return b.likes - a.likes;
+                return byNewest(a, b);
+            });
+            return { item: liked[0], note: '取自点赞最多的答复（' + liked[0].likes + ' 个赞）' };
+        }
+
+        var sorted = items.slice().sort(byNewest);
+        var anyTs = sorted.some(function (it) { return it.ts !== null; });
+        return {
+            item: sorted[0],
+            note: anyTs ? '取自时间最新的答复' : '没能解析出楼层时间，按页面顺序取最后一条'
+        };
+    }
+
+    // 超长就截到句子边界——整段照搬既显眼，又容易撞上站点字数上限
+    function clipReplyText(s) {
+        var t = cleanText(s);
+        var max = CONFIG.DISCUSS_MAX_LEN;
+        if (t.length <= max) return t;
+        var cut = t.slice(0, max);
+        var idx = -1, marks = ['。', '！', '？', '；', '. ', '! ', '? '];
+        for (var i = 0; i < marks.length; i++) {
+            var p = cut.lastIndexOf(marks[i]);
+            if (p > idx) idx = p;
+        }
+        if (idx > max * 0.4) cut = cut.slice(0, idx + 1);
+        return cut;
+    }
+
+    // ===================== 课堂讨论：编辑器与发布 =====================
+    function isEditable(el) {
+        if (!el || !isVisible(el)) return false;
+        if (el.disabled || el.readOnly) return false;
+        var tag = String(el.tagName || '').toUpperCase();
+        if (tag === 'TEXTAREA') return true;
+        if (tag === 'INPUT') return String(el.type || '').toLowerCase() === 'text';
+        var ce = el.getAttribute ? el.getAttribute('contenteditable') : null;
+        return ce !== null && ce !== 'false';
+    }
+
+    // 「空的」= 没内容，或只有占位提示。点开编辑区后站点常把提示写进 DOM，
+    // 不识别就会以为已经有人写过而跳过。
+    function isEmptyEditor(el) {
+        var tag = String(el.tagName || '').toUpperCase();
+        var v = (tag === 'TEXTAREA' || tag === 'INPUT') ? (el.value || '') : (el.textContent || '');
+        v = cleanText(v);
+        if (!v) return true;
+        return isPlaceholderText(v);
+    }
+
+    function findEditorsIn(scope) {
+        var out = [];
+        var els = scope.querySelectorAll('textarea, input[type="text"], [contenteditable]');
+        for (var i = 0; i < els.length; i++) {
+            if (isEditable(els[i]) && isEmptyEditor(els[i])) out.push(els[i]);
+        }
+        return out;
+    }
+
+    // 先在「回复区」作用域里找，找不到再看整页。
+    // 顺序很重要：页面上可能有搜索框、笔记框等其它可编辑区，
+    // 直接全页扫第一个输入框会写错地方。
+    function findReplyEditor() {
+        // SPOC 的编辑器是 Quill（.ql-editor）。先认它，省得在整页 contenteditable
+        // 里摸到搜索框之类的东西
+        if (isSpocCourse()) {
+            var ql = document.querySelector('.ql-editor');
+            if (ql && isEditable(ql) && isEmptyEditor(ql)) return ql;
+        }
+        var scopes = collectCandidates(document, DISCUSS.editorScopeSelectors, 40);
+        var i, found;
+        for (i = 0; i < scopes.length; i++) {
+            found = findEditorsIn(scopes[i]);
+            if (found.length > 0) return found[0];
+        }
+        found = findEditorsIn(document);
+        return found.length > 0 ? found[0] : null;
+    }
+
+    function fillEditor(el, value) {
+        var tag = String(el.tagName || '').toUpperCase();
+        if (tag === 'TEXTAREA' || tag === 'INPUT') {
+            setNativeValue(el, value);
+            return (el.value || '').indexOf(value) !== -1;
+        }
+        el.focus();
+        // 先全选，再走浏览器原生的 insertText 路径：直接改 textContent
+        // 常常被富文本框架忽略，点发布时它读到的还是旧值
+        var sel = window.getSelection();
+        if (sel) {
+            var range = document.createRange();
+            range.selectNodeContents(el);
+            sel.removeAllRanges();
+            sel.addRange(range);
+        }
+        var ok = false;
+        try { ok = document.execCommand('insertText', false, value); } catch (e) { ok = false; }
+        if (!ok || cleanText(el.textContent).indexOf(cleanText(value)) === -1) {
+            el.textContent = value;
+            el.dispatchEvent(new InputEvent('input', { bubbles: true, inputType: 'insertText', data: value }));
+            el.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+        return cleanText(el.textContent).length > 0;
+    }
+
+    // 发布按钮。从编辑器往上爬若干层先找（发布按钮多半和输入框同属一个表单），
+    // 全页兜底时跳过「落在某个楼层里」的按钮——那通常是楼层自己的「回复」小链接。
+    function findSubmitButton(editor, items) {
+        // SPOC 的发布按钮是 .j-edit-btn / .editbtn，文字不一定是「发布」
+        if (isSpocCourse()) {
+            var spocBtn = document.querySelector('.j-edit-btn, .editbtn');
+            if (spocBtn && isVisible(spocBtn) && !spocBtn.disabled) return spocBtn;
+        }
+        var scope = editor, up = 0;
+        while (scope && up < 6) {
+            var btn = findButtonIn(scope);
+            if (btn) return btn;
+            scope = scope.parentElement;
+            up++;
+        }
+        var all = document.querySelectorAll('button, a, div[role="button"], input[type="submit"], span[role="button"]');
+        for (var i = 0; i < all.length; i++) {
+            var el = all[i];
+            if (!isVisible(el) || el.disabled) continue;
+            var t = cleanText(el.textContent || el.value || '');
+            if (!t || t.length > 6) continue;
+            if (!DISCUSS.submitText.test(t)) continue;
+            if (insideAnyItem(el, items)) continue;
+            return el;
+        }
+        return null;
+    }
+
+    function findButtonIn(scope) {
+        if (!scope || !scope.querySelectorAll) return null;
+        var els = scope.querySelectorAll('button, a, div[role="button"], input[type="submit"], span[role="button"]');
+        for (var i = 0; i < els.length; i++) {
+            var el = els[i];
+            if (!isVisible(el) || el.disabled) continue;
+            var t = cleanText(el.textContent || el.value || '');
+            if (!t || t.length > 6) continue;
+            if (DISCUSS.submitText.test(t)) return el;
+        }
+        return null;
+    }
+
+    function insideAnyItem(el, items) {
+        if (!items) return false;
+        for (var i = 0; i < items.length; i++) {
+            if (items[i].el && items[i].el.contains(el)) return true;
+        }
+        return false;
+    }
+
+    // ===================== 课堂讨论：去重留痕 =====================
+    function discussionKey() {
+        var t = '';
+        var h = document.querySelector('h1, [class*="topic-title"], [class*="discuss-title"], [class*="detail-title"], [class*="title"]');
+        if (h) t = cleanText(h.textContent).slice(0, 80);
+        if (!t) t = cleanText(document.title).slice(0, 80);
+        return t + '|' + location.href;
+    }
+
+    function getDiscussHistory() {
+        var h = readStore(DISCUSS.KEY_HISTORY, []);
+        return (h instanceof Array) ? h : [];
+    }
+
+    function alreadyReplied(key) {
+        var h = getDiscussHistory();
+        for (var i = 0; i < h.length; i++) {
+            if (h[i] && h[i].key === key) return h[i].at;
+        }
+        return null;
+    }
+
+    function rememberReplied(key, text) {
+        var h = getDiscussHistory();
+        h.unshift({ key: key, at: Date.now(), text: String(text || '').slice(0, 60) });
+        if (h.length > CONFIG.DISCUSS_HISTORY_MAX) h = h.slice(0, CONFIG.DISCUSS_HISTORY_MAX);
+        writeStore(DISCUSS.KEY_HISTORY, h);
+    }
+
+    function clearDiscussHistory() {
+        writeStore(DISCUSS.KEY_HISTORY, []);
+        updateStatus('🧹 已清除回复记录（记录只用于日志追溯，回复本身不受限制）');
+    }
+
+    // ===================== 课堂讨论：主流程 =====================
+    // 只做「挑内容」这一件事，回复和预览都复用它
+    function resolveReplyContent() {
+        var parsed = parseReplyItems();
+        if (parsed.items.length === 0) {
+            return { ok: false, error: '未解析到已回复的内容，请确认当前页面是课堂讨论页且已有人回复' };
+        }
+        var source = getDiscussSource();
+        var picked = pickSourceReply(parsed.items, source);
+        if (!picked || !picked.item) {
+            return { ok: false, error: '已回复区域里没有可用的正文' };
+        }
+        return {
+            ok: true,
+            items: parsed.items,
+            item: picked.item,
+            note: picked.note,
+            source: source,
+            viaList: parsed.viaList,
+            text: clipReplyText(picked.item.text),
+        };
+    }
+
+    function previewReply() {
+        var r = resolveReplyContent();
+        if (!r.ok) { updateStatus('❌ ' + r.error); return; }
+        var lines = [];
+        lines.push('内容来源：' + sourceLabel(r.source) + '（' + r.note + '）');
+        lines.push('楼层总数：' + r.items.length + ' 条'
+            + (r.viaList ? '' : '   ⚠️ 未命中已知的回复列表容器，为整页兜底解析结果'));
+        lines.push('选中楼层：第 ' + (r.item.index + 1) + ' 条'
+            + (r.item.author ? '，作者「' + r.item.author + '」（已从正文剔除）' : '，作者识别不到')
+            + (r.item.likes !== null ? '，点赞 ' + r.item.likes : '，点赞数未解析到')
+            + (r.item.timeText ? '，时间 ' + r.item.timeText : ''));
+        lines.push('');
+        lines.push('=== 将要回复的内容 ===');
+        lines.push(r.text);
+        showTextOverlay('回复预览 · 尚未发布', lines.join('\n'));
+        updateStatus('🔎 已预览：' + sourceLabel(r.source) + '，共 ' + r.items.length + ' 条答复可选');
+    }
+
+    async function replyDiscussion() {
+        var r = resolveReplyContent();
+        if (!r.ok) { updateStatus('❌ ' + r.error); return; }
+
+        var key = discussionKey();
+        var at = alreadyReplied(key);
+        var hist = getDiscussHistory();
+
+        // 讨论是允许重复回复的，本地历史只作「这条以前回过」的留痕，不再用来拦人。
+        // 但判定结果要写进日志：万一 key 认错（标题取到别处、URL 带随机参数），
+        // 日志里能直接看到「被判成已回复 + 命中的是哪条记录」，不用再猜。
+        if (at) {
+            logDebug('discuss', '判定结果＝已回复（本地记录命中：' + new Date(at).toLocaleString()
+                + '，历史共 ' + hist.length + ' 条）；讨论允许重复回复，本次继续回复');
+            updateStatus('ℹ️ 本地记录显示这条讨论回复过，仍继续回复（讨论允许重复回复）');
+        } else {
+            logDebug('discuss', '判定结果＝未回复（本地历史 ' + hist.length + ' 条，没有这条讨论）；继续回复');
+        }
+
+        updateStatus('正在定位回复输入框...');
+        // 很多站点的输入框要先点一下才会展开真正的编辑区和「发布」按钮
+        var probeEditor = findReplyEditor();
+        if (probeEditor) realClick(probeEditor);
+        await sleep(CONFIG.DELAY_AFTER_CLICK);
+
+        var editor = findReplyEditor();
+        if (!editor) { updateStatus('❌ 未找到可用的回复输入框'); return; }
+
+        updateStatus('正在填入内容（' + sourceLabel(r.source) + '）...');
+        var filled = fillEditor(editor, r.text);
+        if (!filled) { updateStatus('❌ 内容填入失败，未发布任何内容'); return; }
+        await sleep(CONFIG.DISCUSS_FILL_WAIT);
+
+        var btn = findSubmitButton(editor, r.items);
+        if (!btn) {
+            updateStatus('⚠️ 内容已填入输入框，但没找到发布按钮，请手动点击发布');
+            return;
+        }
+
+        updateStatus('正在发布回复...');
+        realClick(btn);
+        await sleep(CONFIG.DELAY_AFTER_SUBMIT);
+        await dismissModal();
+
+        rememberReplied(key, r.text);
+        logDebug('discuss', '已发布回复（' + (at ? '此前回复过，本次为重复回复' : '首次回复') + '）：'
+            + String(r.text).slice(0, 40));
+        updateStatus((at ? '✅ 已再次回复（' : '✅ 已回复（') + sourceLabel(r.source) + ' · ' + r.note + '）');
+    }
+
+    // 页面是否像讨论页：用于决定面板默认打开哪个选项卡。
+    // 判定要偏严。这里只看「回复列表容器」和「多行输入框 / 富文本输入框」，
+    // 不把单行 input 算进去——搜索框、筛选框满页都是，算上会几乎永远为真。
+    function hasDiscussion() {
+        if (collectCandidates(document, DISCUSS.listSelectors, 10).length > 0) return true;
+        var els = document.querySelectorAll('textarea, [contenteditable="true"]');
+        for (var i = 0; i < els.length; i++) {
+            if (isVisible(els[i])) return true;
+        }
+        return false;
+    }
+
+    // 通用文本浮层：回复预览、诊断报告共用。
+    // 传了 onSave 就多一个「保存」按钮，文本框可编辑；否则是只读查看。
+    function showTextOverlay(title, text, onSave) {
+        var old = document.getElementById('mar-probe-overlay');
+        if (old && old.parentNode) old.parentNode.removeChild(old);
+
+        var overlay = document.createElement('div');
+        overlay.id = 'mar-probe-overlay';
+        overlay.innerHTML = [
+            '<div id="mar-probe-head">',
+            '  <span id="mar-probe-title"></span>',
+            '  <span id="mar-probe-actions">',
+            onSave ? '    <button id="mar-probe-save" class="mar-btn">保存</button>' : '',
+            '    <button id="mar-probe-copy" class="mar-btn">复制</button>',
+            '    <button id="mar-probe-close" class="mar-btn">关闭</button>',
+            '  </span>',
+            '</div>',
+            '<textarea id="mar-probe-text" spellcheck="false"></textarea>'
+        ].join('');
+        document.body.appendChild(overlay);
+
+        // 标题用 textContent 赋值，避免把内容里的尖括号当 HTML 解析
+        document.getElementById('mar-probe-title').textContent = title;
+
+        var ta = document.getElementById('mar-probe-text');
+        ta.value = text;
+        ta.focus();
+        ta.select();
+
+        document.getElementById('mar-probe-close').addEventListener('click', function () {
+            if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+        });
+        document.getElementById('mar-probe-copy').addEventListener('click', function () {
+            ta.focus();
+            ta.select();
+            var ok = false;
+            try { ok = document.execCommand('copy'); } catch (e) { ok = false; }
+            updateStatus(ok ? '✅ 已复制到剪贴板' : '⚠️ 自动复制失败，请手动全选复制文本框内容');
+        });
+        if (onSave) {
+            document.getElementById('mar-probe-save').addEventListener('click', function () {
+                onSave(ta.value);
+                if (overlay.parentNode) overlay.parentNode.removeChild(overlay);
+            });
+        }
+    }
+    // ===================== 状态栏 & 按钮 =====================
+    var statusEl = null;
+    // ===================== 开发者调试日志 =====================
+    // 目的：记录「检测到了什么、走到了哪一步、为什么这样决策」，
+    // 便于开发者排查问题（不是给使用者看完成情况）。面板「日志」页签可查看/复制/清空。
+    var debugLogs = [];
+    var DEBUG_LOG_MAX = 500;      // 内存里最多保留多少条，超出丢最旧
+    var DEBUG_LOG_SHOW = 120;     // 面板里最多展示多少条
+
+    // 追加一条调试日志。cat 是分类标签（type/nav/menu/learn/video/doc/quiz/status/err…）
+    function logDebug(cat, msg) {
+        var t = new Date();
+        // 精确到分钟就够了：秒和毫秒在这个场景里没人看，还把每行挤得很长
+        var ts = ('0' + t.getHours()).slice(-2) + ':' + ('0' + t.getMinutes()).slice(-2);
+        debugLogs.push({ t: ts, cat: cat, msg: String(msg || '') });
+        if (debugLogs.length > DEBUG_LOG_MAX) debugLogs.splice(0, debugLogs.length - DEBUG_LOG_MAX);
+        try { console.log('[MOOC:' + cat + ']', ts, msg); } catch (e) {}
+        refreshLogBox();
+    }
+
+    // 把日志渲染进面板（只在日志页签可见时渲染，避免高频操作拖慢页面）
+    function escHtml(s) {
+        return String(s === null || s === undefined ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    // 一条日志的 HTML：行号 + 时间 + 分类 + 正文。
+    // 行号是「第几条」，不是「本屏第几条」——滚到中间也能对上弹窗里的位置。
+    function logLineHtml(l, no) {
+        return '<div class="mar-log-line">'
+            + '<span class="mar-log-n">' + no + '</span>'
+            + '<span class="mar-log-body"><span class="mar-log-t">' + l.t + '</span>'
+            + '[<span class="mar-log-cat">' + l.cat + '</span>] ' + escHtml(l.msg) + '</span>'
+            + '</div>';
+    }
+
+    function refreshLogBox() {
+        var box = document.getElementById('mar-log-box');
+        if (!box) return;
+        // 日志框外面还套了一层 .mar-log-wrap（放右上角展开键），
+        // 所以不能只看 parentElement，要往上找到页签本身
+        var pane = box.closest ? box.closest('.mar-pane') : null;
+        if (!pane || !pane.classList.contains('mar-active')) {
+            // 页签没显示就不重绘面板，但弹窗可能正开着，得跟着刷
+            refreshLogOverlay();
+            return;
+        }
+        var frag = [];
+        var start = Math.max(0, debugLogs.length - DEBUG_LOG_SHOW);
+        for (var i = start; i < debugLogs.length; i++) {
+            frag.push(logLineHtml(debugLogs[i], i + 1));
+        }
+        box.innerHTML = frag.length ? frag.join('') : '<div class="mar-log-empty">（暂无日志）</div>';
+        try { box.scrollTop = box.scrollHeight; } catch (e) {}
+        refreshLogOverlay();
+    }
+
+    // ===================== 日志弹窗（展开查看） =====================
+    // 面板里的日志框只有 150px 高、最多 120 条，翻起来很难受。
+    // 点日志框右上角那个展开键，弹出居中大窗看全部（最多 DEBUG_LOG_MAX 条）。
+    function logOverlayEl() { return document.getElementById('mar-log-overlay'); }
+
+    function refreshLogOverlay() {
+        var overlay = logOverlayEl();
+        var full = document.getElementById('mar-log-full');
+        if (!overlay || !full || overlay.style.display === 'none') return;
+        // 用户正往上翻的时候别把他拽回底部；只有原本就在底部才自动跟最新
+        var keep = full.scrollTop;
+        var atBottom = full.scrollHeight - keep - full.clientHeight <= 24;
+        var frag = [];
+        for (var i = 0; i < debugLogs.length; i++) frag.push(logLineHtml(debugLogs[i], i + 1));
+        full.innerHTML = frag.length ? frag.join('') : '<div class="mar-log-empty">（暂无日志）</div>';
+        var title = document.getElementById('mar-log-title');
+        if (title) title.textContent = '调试日志 · 共 ' + debugLogs.length + ' 条';
+        try { full.scrollTop = atBottom ? full.scrollHeight : keep; } catch (e) {}
+    }
+
+    function openLogOverlay() {
+        var overlay = logOverlayEl();
+        if (!overlay) return;
+        overlay.style.display = 'flex';
+        var full = document.getElementById('mar-log-full');
+        if (full) full.scrollTop = full.scrollHeight;
+        refreshLogOverlay();
+    }
+
+    function closeLogOverlay() {
+        var overlay = logOverlayEl();
+        if (overlay) overlay.style.display = 'none';
+    }
+
+    function createLogOverlay() {
+        if (logOverlayEl()) return;
+        var overlay = document.createElement('div');
+        overlay.id = 'mar-log-overlay';
+        overlay.style.display = 'none';
+        overlay.innerHTML = [
+            '<div id="mar-log-card">',
+            '  <div id="mar-log-head">',
+            '    <span id="mar-log-title">调试日志</span>',
+            '    <span id="mar-log-head-actions">',
+            '      <button id="mar-log-full-copy" class="mar-btn">复制全部</button>',
+            '      <button id="mar-log-close" title="关闭">×</button>',
+            '    </span>',
+            '  </div>',
+            '  <div id="mar-log-full" class="mar-log-full"></div>',
+            '</div>'
+        ].join('');
+        document.body.appendChild(overlay);
+
+        // 点遮罩空白处关闭；点卡片内部不关
+        overlay.addEventListener('click', function (e) {
+            if (e.target === overlay) closeLogOverlay();
+        });
+        document.getElementById('mar-log-close').addEventListener('click', closeLogOverlay);
+        document.getElementById('mar-log-full-copy').addEventListener('click', copyDebugLogs);
+        document.addEventListener('keydown', function (e) {
+            if ((e.key === 'Escape' || e.key === 'Esc') && overlay.style.display === 'flex') closeLogOverlay();
+        });
+    }
+
+    function clearDebugLogs() {
+        debugLogs = [];
+        refreshLogBox();
+    }
+
+    // 复制日志到剪贴板（格式：时间 [分类] 消息，每行一条）
+    function copyDebugLogs() {
+        var text = debugLogs.map(function (l) { return l.t + ' [' + l.cat + '] ' + l.msg; }).join('\n');
+        if (!text) { updateStatus('暂无日志可复制'); return; }
+        try {
+            var ta = document.createElement('textarea');
+            ta.value = text;
+            ta.style.position = 'fixed';
+            ta.style.left = '-9999px';
+            document.body.appendChild(ta);
+            ta.select();
+            document.execCommand('copy');
+            document.body.removeChild(ta);
+            updateStatus('✅ 已复制 ' + debugLogs.length + ' 条日志');
+        } catch (e) {
+            showTextOverlay('调试日志', text);
+            updateStatus('已用浮层展示日志（复制失败）');
+        }
+    }
+
+    function updateStatus(msg) {
+        if (statusEl) statusEl.textContent = msg;
+        logDebug('status', msg);
+    }
+
+    // 按选择器收集而不是硬编码 id 列表。原来那份硬编码清单是个持续的坑：
+    // 每加一个按钮都得记得往数组里补一条，漏了就变成「运行期间还能点」。
+    function setButtonsRunning(isRunning) {
+        var btns = document.querySelectorAll('#mooc-auto-review-panel .mar-btn');
+        for (var i = 0; i < btns.length; i++) {
+            var el = btns[i];
+            if (el.id === 'mar-stop') continue;
+            // 开关类按钮（解除复制）与任务状态无关，
+            // 任务跑着的时候也应该能随时切换
+            if (el.classList.contains('mar-toggle')) continue;
+            // 日志按钮同理：跑着的时候也需要能复制/清空/展开排查问题
+            if (el.id === 'mar-log-copy' || el.id === 'mar-log-clear' || el.id === 'mar-log-expand') continue;
+            // 问题反馈是 <a>，本来就不该被任务状态锁住（出问题时正是要反馈）
+            if (el.id === 'mar-feedback') continue;
+            // 官网链接同理：什么时候都能点，和任务状态无关
+            if (el.classList.contains('mar-site')) continue;
+            el.disabled = isRunning;
+        }
+        var stop = document.getElementById('mar-stop');
+        if (stop) {
+            stop.style.display = isRunning ? 'flex' : 'none';
+            stop.disabled = !isRunning;
+        }
+    }
+    function injectStyles() {
+        if (document.getElementById('mar-glass-styles')) return;
+        var style = document.createElement('style');
+        style.id = 'mar-glass-styles';
+        style.textContent = [
+            '#mooc-auto-review-panel {',
+            '  position: fixed !important;',
+            '  top: 100px; right: 20px;',
+            '  z-index: 2147483647 !important;',
+            '  width: 238px;',
+            '  border-radius: 14px;',
+            '  overflow: hidden;',
+            '  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;',
+            '  color: #ededed;',
+            '  user-select: none;',
+            '  background: #18181b;',
+            '  border: 1px solid rgba(255, 255, 255, 0.1);',
+            '  box-shadow: 0 12px 32px -12px rgba(0, 0, 0, 0.65), 0 2px 8px -2px rgba(0, 0, 0, 0.4);',
+            '}',
+            '#mar-header {',
+            '  display: flex; justify-content: space-between; align-items: center;',
+            '  padding: 10px 12px; cursor: move;',
+            '  border-bottom: 1px solid rgba(255, 255, 255, 0.07);',
+            '}',
+            '#mar-title { display: flex; align-items: center; gap: 7px; font-size: 12.5px; font-weight: 600; color: #ededed; }',
+            '#mar-title .mar-dot { width: 6px; height: 6px; border-radius: 50%; background: #3b82f6; }',
+            '#mar-head-actions { display: flex; align-items: center; gap: 2px; }',
+            '#mar-help, #mar-minimize {',
+            '  width: 22px; height: 22px; padding: 0;',
+            '  display: flex; align-items: center; justify-content: center;',
+            '  border: 0; border-radius: 6px; background: transparent;',
+            '  color: #8a8a90; font-family: inherit; font-size: 12px; line-height: 1;',
+            '  cursor: pointer; transition: background 0.15s ease, color 0.15s ease;',
+            '}',
+            '#mar-help:hover, #mar-minimize:hover { background: rgba(255, 255, 255, 0.08); color: #ededed; }',
+            // 标题栏的「官网」：和 ?/− 一样高，但它是文字链接，不能套 22px 定宽
+            '#mar-head-actions .mar-head-link {',
+            '  height: 22px; padding: 0 5px;',
+            '  display: flex; align-items: center;',
+            '  border-radius: 6px; text-decoration: none;',
+            '  color: #8a8a90; font-size: 11px; line-height: 1; letter-spacing: 0.2px;',
+            '  transition: background 0.15s ease, color 0.15s ease;',
+            '}',
+            '#mar-head-actions .mar-head-link:hover { background: rgba(255, 255, 255, 0.08); color: #ededed; }',
+            '#mar-tabs { display: flex; gap: 2px; padding: 8px 8px 0; }',
+            '.mar-tab {',
+            '  flex: 1; padding: 6px 2px; border: 0; border-radius: 6px;',
+            '  background: transparent; color: #8a8a90;',
+            '  font-family: inherit; font-size: 11.5px; font-weight: 500;',
+            '  cursor: pointer; transition: background 0.15s ease, color 0.15s ease;',
+            '}',
+            '.mar-tab:hover:not(.mar-active) { color: #c4c4c8; background: rgba(255, 255, 255, 0.05); }',
+            '.mar-tab.mar-active { color: #ffffff; background: rgba(255, 255, 255, 0.1); }',
+            '.mar-pane { display: none; flex-direction: column; gap: 6px; }',
+            '.mar-pane.mar-active { display: flex; }',
+            '#mar-body { padding: 8px; }',
+            '#mar-foot { padding: 0 8px 10px; display: flex; flex-direction: column; gap: 6px; }',
+            '.mar-btn {',
+            '  display: flex; align-items: center;',
+            '  width: 100%; padding: 8px 10px;',
+            '  box-sizing: border-box; text-decoration: none;',
+            '  border: 1px solid transparent; border-radius: 8px;',
+            '  background: rgba(255, 255, 255, 0.055);',
+            '  color: #e4e4e7; font-family: inherit;',
+            '  font-size: 12px; font-weight: 400; text-align: left;',
+            '  cursor: pointer;',
+            '  transition: background 0.15s ease, border-color 0.15s ease;',
+            '}',
+            '.mar-btn:hover:not(:disabled) { background: rgba(255, 255, 255, 0.1); }',
+            '.mar-btn:active:not(:disabled) { background: rgba(255, 255, 255, 0.14); }',
+            '.mar-btn:disabled { opacity: 0.34; cursor: not-allowed; }',
+            '#mar-review-counts { display: flex; flex-direction: column; gap: 6px; }',
+            '.mar-review-delete:not(:disabled) { color: #f87171; background: rgba(248, 113, 113, 0.12); border-color: rgba(248, 113, 113, 0.32); }',
+            '.mar-review-delete:hover:not(:disabled) { background: rgba(248, 113, 113, 0.2); }',
+            '#mar-review-custom:not(:disabled) { color: #60a5fa; }',
+            '#mar-stop { display: none; }',
+            '#mar-stop:not(:disabled) { color: #f87171; background: rgba(248, 113, 113, 0.1); }',
+            '#mar-stop:hover:not(:disabled) { background: rgba(248, 113, 113, 0.16); }',
+            '#mar-status {',
+            '  padding: 6px 2px 0;',
+            '  font-size: 11px; line-height: 1.55; color: #8a8a90;',
+            '  min-height: 16px; word-break: break-word;',
+            '}',
+            '.mar-log-box {',
+            '  height: 150px; overflow-y: auto;',
+            '  padding: 8px; border-radius: 8px;',
+            '  background: #0f0f11;',
+            '  border: 1px solid rgba(255, 255, 255, 0.07);',
+            '  font-family: Menlo, Consolas, "SF Mono", monospace;',
+            '  font-size: 10.5px; line-height: 1.5;',
+            '  color: #d4d4d8; white-space: pre-wrap; word-break: break-all;',
+            '}',
+            '.mar-log-line { display: flex; align-items: flex-start; gap: 5px; margin: 1px 0; }',
+            '.mar-log-n {',
+            '  flex: 0 0 auto; min-width: 22px; text-align: right;',
+            '  color: #52525b; user-select: none; font-variant-numeric: tabular-nums;',
+            '}',
+            '.mar-log-body { flex: 1 1 auto; }',
+            '.mar-log-t { color: #6b6b75; margin-right: 4px; }',
+            '.mar-log-cat { color: #60a5fa; font-weight: 600; }',
+            '.mar-log-empty { color: #6b6b75; padding: 8px 2px; }',
+            // 日志弹窗：居中的大窗，内容可滚动、可选中复制
+            '#mar-log-overlay {',
+            '  position: fixed !important; inset: 0;',
+            '  z-index: 2147483647 !important;',
+            '  align-items: center; justify-content: center;',
+            '  background: rgba(0, 0, 0, 0.6);',
+            '  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;',
+            '}',
+            '#mar-log-card {',
+            '  width: min(780px, 92vw); max-height: 84vh;',
+            '  display: flex; flex-direction: column; overflow: hidden;',
+            '  background: #18181b; color: #ededed;',
+            '  border: 1px solid rgba(255, 255, 255, 0.1);',
+            '  border-radius: 14px;',
+            '  box-shadow: 0 24px 60px -12px rgba(0, 0, 0, 0.7);',
+            '}',
+            '#mar-log-head {',
+            '  display: flex; justify-content: space-between; align-items: center;',
+            '  padding: 12px 14px;',
+            '  border-bottom: 1px solid rgba(255, 255, 255, 0.07);',
+            '  font-size: 13px; font-weight: 600;',
+            '}',
+            '#mar-log-head-actions { display: flex; align-items: center; gap: 6px; }',
+            '#mar-log-full-copy { width: auto; padding: 5px 10px; font-size: 11.5px; }',
+            '#mar-log-close {',
+            '  width: 24px; height: 24px; padding: 0;',
+            '  display: flex; align-items: center; justify-content: center;',
+            '  border: 0; border-radius: 6px; background: transparent;',
+            '  color: #8a8a90; font-family: inherit; font-size: 16px; line-height: 1;',
+            '  cursor: pointer;',
+            '}',
+            '#mar-log-close:hover { background: rgba(255, 255, 255, 0.08); color: #ededed; }',
+            '#mar-log-full {',
+            '  padding: 10px 14px 14px; overflow-y: auto;',
+            '  font-family: Menlo, Consolas, "SF Mono", monospace;',
+            '  font-size: 11.5px; line-height: 1.65; color: #d4d4d8;',
+            '  white-space: pre-wrap; word-break: break-all;',
+            '  user-select: text;',
+            '}',
+            '#mar-copy-unlock.mar-on:not(:disabled) { color: #4ade80; background: rgba(74, 222, 128, 0.1); }',
+            '#mar-copy-unlock.mar-on:hover:not(:disabled) { background: rgba(74, 222, 128, 0.16); }',
+            '.mar-field {',
+            '  display: flex; flex-direction: column; gap: 5px;',
+            '  padding: 8px 10px; border-radius: 8px;',
+            '  background: rgba(255, 255, 255, 0.035);',
+            '}',
+            '.mar-label { font-size: 11.5px; font-weight: 500; color: #a1a1aa; }',
+            '.mar-hint { font-size: 10.5px; line-height: 1.5; color: #6b6b75; }',
+            '.mar-seg { display: flex; gap: 2px; padding: 2px; border-radius: 7px; background: rgba(0, 0, 0, 0.35); }',
+            '.mar-seg-btn {',
+            '  flex: 1; padding: 5px 4px; border: 0; border-radius: 5px;',
+            '  background: transparent; color: #8a8a90;',
+            '  font-family: inherit; font-size: 11px; font-weight: 500;',
+            '  cursor: pointer; transition: background 0.15s ease, color 0.15s ease;',
+            '}',
+            '.mar-seg-btn:hover:not(.mar-active) { color: #c4c4c8; }',
+            '.mar-seg-btn.mar-active { background: rgba(255, 255, 255, 0.12); color: #ffffff; }',
+            '#mar-video-rate { width: 100%; height: 16px; margin: 2px 0; appearance: none; -webkit-appearance: none; background: transparent; cursor: pointer; }',
+            '#mar-video-rate::-webkit-slider-runnable-track { height: 3px; border-radius: 2px; background: rgba(255, 255, 255, 0.16); }',
+            '#mar-video-rate::-webkit-slider-thumb { -webkit-appearance: none; width: 12px; height: 12px; margin-top: -4.5px; border-radius: 50%; background: #3b82f6; }',
+            '#mar-video-rate::-moz-range-track { height: 3px; border-radius: 2px; background: rgba(255, 255, 255, 0.16); }',
+            '#mar-video-rate::-moz-range-thumb { width: 12px; height: 12px; border: 0; border-radius: 50%; background: #3b82f6; }',
+            // 使用说明浮层：单独按钮打开，盖一层暗色遮罩，内容可滚动、可选中复制
+            '#mar-help-overlay {',
+            '  position: fixed !important; inset: 0;',
+            '  z-index: 2147483647 !important;',
+            '  display: flex; align-items: center; justify-content: center;',
+            '  background: rgba(0, 0, 0, 0.55);',
+            '  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;',
+            '}',
+            '#mar-help-card {',
+            '  width: min(520px, 90vw); max-height: 82vh;',
+            '  display: flex; flex-direction: column; overflow: hidden;',
+            '  background: #18181b; color: #ededed;',
+            '  border: 1px solid rgba(255, 255, 255, 0.1);',
+            '  border-radius: 14px;',
+            '  box-shadow: 0 24px 60px -12px rgba(0, 0, 0, 0.7);',
+            '}',
+            '#mar-help-head {',
+            '  display: flex; justify-content: space-between; align-items: center;',
+            '  padding: 14px 16px;',
+            '  border-bottom: 1px solid rgba(255, 255, 255, 0.07);',
+            '  font-size: 13px; font-weight: 600;',
+            '}',
+            '#mar-help-close {',
+            '  width: 24px; height: 24px; padding: 0;',
+            '  display: flex; align-items: center; justify-content: center;',
+            '  border: 0; border-radius: 6px; background: transparent;',
+            '  color: #8a8a90; font-family: inherit; font-size: 16px; line-height: 1;',
+            '  cursor: pointer;',
+            '}',
+            '#mar-help-close:hover { background: rgba(255, 255, 255, 0.08); color: #ededed; }',
+            '#mar-help-body {',
+            '  padding: 4px 16px 18px; overflow-y: auto;',
+            '  font-size: 12px; line-height: 1.7; color: #c4c4c8;',
+            '  user-select: text;',
+            '}',
+            '#mar-help-body h4 {',
+            '  margin: 14px 0 4px; font-size: 12px; font-weight: 600; color: #ffffff;',
+            '}',
+            '#mar-help-body h4:first-child { margin-top: 10px; }',
+            '#mar-help-body ul { margin: 0; padding-left: 17px; }',
+            '#mar-help-body li { margin: 2px 0; }',
+            '#mar-help-body code {',
+            '  padding: 1px 4px; border-radius: 4px;',
+            '  background: rgba(255, 255, 255, 0.08); color: #d4d4d8;',
+            '  font-family: Menlo, Consolas, monospace; font-size: 11px;',
+            '}',
+            // 探针结果浮层：只读诊断用，全选复制
+            '#mar-probe-overlay {',
+            '  position: fixed !important;',
+            '  top: 5vh; left: 50%; transform: translateX(-50%);',
+            '  width: min(900px, 92vw); height: 90vh;',
+            '  z-index: 2147483647 !important;',
+            '  display: flex; flex-direction: column;',
+            '  border-radius: 14px; overflow: hidden;',
+            '  background: rgba(28, 28, 32, 0.97);',
+            '  border: 1px solid rgba(255, 255, 255, 0.16);',
+            '  box-shadow: 0 24px 60px -12px rgba(0, 0, 0, 0.6);',
+            '  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", Roboto, "PingFang SC", "Microsoft YaHei", sans-serif;',
+            '  user-select: text;',
+            '}',
+            '#mar-probe-head {',
+            '  display: flex; justify-content: space-between; align-items: center;',
+            '  gap: 12px; padding: 10px 14px;',
+            '  background: rgba(255, 255, 255, 0.06);',
+            '  border-bottom: 1px solid rgba(255, 255, 255, 0.12);',
+            '  color: #f2f2f7; font-size: 13px; font-weight: 600;',
+            '}',
+            '#mar-probe-actions { display: flex; gap: 8px; }',
+            '#mar-probe-actions .mar-btn {',
+            '  padding: 5px 12px; font-size: 12px; width: auto;',
+            '  color: #f2f2f7; background: rgba(255, 255, 255, 0.12);',
+            '  border: 1px solid rgba(255, 255, 255, 0.2);',
+            '}',
+            '#mar-probe-actions .mar-btn::before { display: none; }',
+            '#mar-probe-actions .mar-btn:hover:not(:disabled) { background: rgba(255, 255, 255, 0.22); }',
+            '#mar-probe-text {',
+            '  flex: 1; width: 100%; resize: none; border: 0; outline: none;',
+            '  padding: 12px 14px; margin: 0;',
+            '  background: transparent; color: #d7d7dc;',
+            '  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;',
+            '  font-size: 12px; line-height: 1.5;',
+            '  white-space: pre; overflow: auto;',
+            '  user-select: text;',
+            '}',
+        ].join('\n');
+        document.head.appendChild(style);
+    }
+
+    // ===================== 悬浮窗 UI =====================
+    // 选项卡名 → 视图。切选项卡只是换 .mar-pane 的显示，不动任何任务状态，
+    // 所以任务跑着的时候切走再切回来不会打断它。
+    function switchTab(name) {
+        // 名字不存在就直接不动。真要是切到一个拼错的视图名，所有 pane 都不带
+        // .mar-active，面板会变成一片空白且看不出原因——不如保持原样。
+        if (!document.querySelector('#mooc-auto-review-panel .mar-pane[data-pane="' + name + '"]')) return;
+        var tabs = document.querySelectorAll('#mooc-auto-review-panel .mar-tab');
+        for (var i = 0; i < tabs.length; i++) {
+            var on = tabs[i].getAttribute('data-tab') === name;
+            if (on) tabs[i].classList.add('mar-active');
+            else tabs[i].classList.remove('mar-active');
+        }
+        var panes = document.querySelectorAll('#mooc-auto-review-panel .mar-pane');
+        for (var j = 0; j < panes.length; j++) {
+            var p = panes[j];
+            if (p.getAttribute('data-pane') === name) p.classList.add('mar-active');
+            else p.classList.remove('mar-active');
+        }
+    }
+
+    // 把存储里的「内容来源」同步到设置页的高亮，以及讨论页上的那行说明
+    function updateSourceSeg() {
+        var cur = getDiscussSource();
+        var btns = document.querySelectorAll('#mooc-auto-review-panel .mar-seg-btn');
+        for (var i = 0; i < btns.length; i++) {
+            var on = btns[i].getAttribute('data-source') === cur;
+            if (on) btns[i].classList.add('mar-active');
+            else btns[i].classList.remove('mar-active');
+        }
+        var now = document.getElementById('mar-source-now');
+        if (now) now.textContent = sourceLabel(cur);
+    }
+
+    // 默认打开哪个选项卡，按页面内容定：看着像讨论页就给「讨论」，其余给「互评」。
+    // 只在面板创建时判定一次——之后用户手动切到哪就是哪，不跟着 hash 导航乱跳。
+    function pickDefaultTab() {
+        // 学习是主功能，默认就停在「学习」页签上。
+        // 只有当地址明确指向讨论详情（hash 里带 forum/discuss/topic）时，
+        // 才自动让位给「讨论」——这是唯一能确定用户此刻在看讨论的可靠信号。
+        if (/forumdetail|forum|discuss|discussion|topic/i.test(location.hash || '')) return 'discuss';
+        return 'auto';
+    }
+
+    // ===================== 使用说明浮层 =====================
+    // 面板本身只留按钮，所有解释文案集中到这里：标题栏右上角的「?」打开。
+    // 独立挂到 body（不放进面板），避免被面板的 overflow 裁掉。
+    var HELP_HTML = [
+        '<h4>互评</h4>',
+        '<ul>',
+        '<li><b>6 份互评</b>：从当前互评详情开始，连续处理 6 份。</li>',
+        '<li><b>自定义份数</b>：输入 1–' + CONFIG.REVIEW_COUNT_MAX + ' 之间的整数，生成新的互评按钮。</li>',
+        '<li><b>删除份数</b>：右键份数按钮，它会变成红色 <code>delete</code>，再左键点击即删除；“自定义份数”不能删除。</li>',
+        '</ul>',
+        '<h4>课堂讨论</h4>',
+        '<ul>',
+        '<li><b>预览</b>：只显示将从哪条已有回复里取正文，不发布。<b>一键回复</b>：填进编辑器并发布。</li>',
+        '<li>正文只从已有人回复里取，不自己编。</li>',
+        '<li><b>讨论允许重复回复</b>：本地留痕只会写进日志（判定为「已回复 / 未回复」），命中历史也照样继续回复。</li>',
+        '<li>来源可在「设置」里切换最新答复 / 点赞最多，页面没显示点赞数时自动退回最新一条。</li>',
+        '</ul>',
+        '<h4>随堂测验</h4>',
+        '<ul>',
+        '<li>只在小节内容条里那个「测试」标签下生效——它和视频、文档、讨论同级，通常不限次数。</li>',
+        '<li>答案来源：MOOC 走课件接口 <code>unit-page</code>，SPOC 走 dwr 的 <code>getLessonUnitLearnVo</code>。</li>',
+        '<li>读不到答案就一个选项都不点、也不提交；有题目没匹配上时只填不交，留给你手动补完。</li>',
+        '<li>已经答过的会先点「重新答题」再作答。</li>',
+        '<li><b>填空题</b>：按题干匹配到题目后，把答案写进空里（支持多个空、以及富文本填空框）。答案字段兼容 <code>correctOptionList</code> / <code>answers</code> / <code>correctAnswer</code>；接口没给答案就不填、也不提交。</li>',
+        '<li>单元测验、作业、考试是独立页面，一律不处理。</li>',
+        '<li>自动学习走到这里时，会先等最多 8 秒让题块渲染出来再判定，不会因为「刚切过来还空着」就跳过。</li>',
+        '</ul>',
+        '<h4>自动学习</h4>',
+        '<ul>',
+        '<li>从当前内容开始，学完一个自动进下一个，直到全部学完；页面刷新后自动续跑。</li>',
+        '<li><b>视频</b>：从头播放（可调倍速），播完进下一个内容；落点是<b>此前已看完</b>的视频时不重播，直接前进。</li>',
+        '<li><b>文档 / 课件</b>：每页约 1 秒自动翻页。<b>富文本</b>：停留 10 秒后跳转。</li>',
+        '<li><b>讨论</b>：自动回复。</li>',
+        '<li><b>随堂测验</b>：自动作答并提交，提交后停留 10 秒再进下一个内容。</li>',
+        '<li><b>每次跳转后先硬等 10 秒</b>再处理新内容——刚切过去时页面还是上一份内容，立刻判定会认错类型甚至秒跳下一节。等待期间点【下一节】可提前跳过。</li>',
+        '<li>这 10 秒里脚本会<b>盯住自己该在哪个内容上</b>：平台的「自动播放下一集」若把页面带走了（已看完的视频约 5 秒后就会跳到下一个视频），脚本立刻切回原内容并重新计时，不会顺着平台跳过中间的文档 / 测验 / 讨论。</li>',
+        '<li><b>单元测验 / 作业 / 考试</b>：不进入。</li>',
+        '<li><b>视频中弹题</b>：默认<b>直接拦截</b>——不让视频暂停、浮层一冒出来就收掉，视频一路播到底；实在拦不住（浮层包着播放器）时才自动作答并提交，答案优先取课件接口里的正确答案，取不到才退化为顺位作答。<b>设置</b>页签可关掉拦截退回纯自动作答。</li>',
+        '<li>右下角<b>【下一节】</b>随时可点，立即跳到下一个内容。</li>',
+        '</ul>',
+        '<h4>日志与诊断</h4>',
+        '<ul>',
+        '<li>「日志」页记录检测结果、跳转决策与异常，每条带行号（时间精确到分钟）。点「展开」弹窗看全部日志，可选中复制。</li>',
+        '<li>「页面 DOM 诊断」导出当前页面结构快照，用于适配改版后的页面。其中的【讨论正文解析实测】会逐条列出楼层原文、识别到的作者名、以及最终会发出去的正文——讨论回复内容不对时，先看这一段。</li>',
+        '</ul>',
+        '<h4>设置</h4>',
+        '<ul>',
+        '<li>讨论内容来源、视频倍速（0.5x ~ 3x）、<b>视频弹题拦截</b>（关掉则退回自动作答）、解除页面复制限制、清除讨论回复记录。</li>',
+        '<li><b>问题反馈</b>：点一下直接打开 GitHub 的新建 Issue 页面。反馈时请附上「日志」里相关的几行，以及「页面 DOM 诊断」导出的结构，定位会快很多。</li>',
+        '<li><b>官网</b>：打开功能说明、图文教程与更新记录的站点（标题栏右上角也有一个）。</li>',
+        '</ul>',
+        '<h4>课程类型</h4>',
+        '<ul>',
+        '<li>自动识别 MOOC 与 SPOC 两套前端并分别适配，两条路径互不影响。</li>',
+        '</ul>',
+    ].join('');
+
+    function setHelpVisible(show) {
+        var o = document.getElementById('mar-help-overlay');
+        if (!o) return;
+        o.style.display = show ? 'flex' : 'none';
+    }
+
+    function createHelpOverlay() {
+        if (document.getElementById('mar-help-overlay')) return;
+        var wrap = document.createElement('div');
+        wrap.id = 'mar-help-overlay';
+        wrap.style.display = 'none';
+        wrap.innerHTML = [
+            '<div id="mar-help-card">',
+            '  <div id="mar-help-head">',
+            '    <span>使用说明</span>',
+            '    <button id="mar-help-close" title="关闭">×</button>',
+            '  </div>',
+            '  <div id="mar-help-body">' + HELP_HTML + '</div>',
+            '</div>',
+        ].join('');
+        document.body.appendChild(wrap);
+
+        document.getElementById('mar-help-close').addEventListener('click', function () { setHelpVisible(false); });
+        // 点遮罩空白处关闭；点卡片内部不关
+        wrap.addEventListener('click', function (e) { if (e.target === wrap) setHelpVisible(false); });
+        document.addEventListener('keydown', function (e) {
+            if (e.key === 'Escape' && wrap.style.display === 'flex') setHelpVisible(false);
+        });
+
+        var helpBtn = document.getElementById('mar-help');
+        if (helpBtn) helpBtn.addEventListener('click', function () { setHelpVisible(true); });
+    }
+
+    function createFloatingPanel() {
+        if (document.getElementById('mooc-auto-review-panel')) return;
+        injectStyles();
+
+        var panel = document.createElement('div');
+        panel.id = 'mooc-auto-review-panel';
+        panel.innerHTML = [
+            '<div id="mar-header">',
+            '  <span id="mar-title"><span class="mar-dot"></span>MOOC 互评</span>',
+            '  <span id="mar-head-actions">',
+            '    <button id="mar-minimize" title="最小化">−</button>',
+            '  </span>',
+            '</div>',
+            '<div id="mar-main">',
+            '  <div id="mar-body">',
+            '    <div class="mar-pane mar-active" data-pane="review">',
+            '      <div id="mar-review-counts"></div>',
+            '      <button id="mar-review-custom" class="mar-btn">自定义互评份数</button>',
+            '    </div>',
+            '  </div>',
+            '  <div id="mar-foot">',
+            '    <button id="mar-stop" class="mar-btn">停止当前操作</button>',
+            '    <div id="mar-status">就绪</div>',
+            '  </div>',
+            '</div>'
+        ].join('');
+        document.body.appendChild(panel);
+
+        statusEl = document.getElementById('mar-status');
+
+        var minimized = false;
+        var mainEl = document.getElementById('mar-main');
+        document.getElementById('mar-minimize').addEventListener('click', function () {
+            minimized = !minimized;
+            mainEl.style.display = minimized ? 'none' : '';
+            document.getElementById('mar-minimize').textContent = minimized ? '+' : '−';
+        });
+
+        var header = document.getElementById('mar-header');
+        var dragging = false, sx = 0, sy = 0, sl = 0, st = 0;
+        header.addEventListener('mousedown', function (e) {
+            // 标题栏右侧的「−」是按钮，不要触发拖动
+            if (e.target && e.target.closest && e.target.closest('#mar-head-actions')) return;
+            if (e.target && e.target.id === 'mar-minimize') return;
+            dragging = true;
+            sx = e.clientX; sy = e.clientY;
+            var rect = panel.getBoundingClientRect();
+            sl = rect.left; st = rect.top;
+            e.preventDefault();
+        });
+        document.addEventListener('mousemove', function (e) {
+            if (!dragging) return;
+            panel.style.left = (sl + e.clientX - sx) + 'px';
+            panel.style.top = (st + e.clientY - sy) + 'px';
+            panel.style.right = 'auto';
+        });
+        document.addEventListener('mouseup', function () { dragging = false; });
+
+        function guard(fn) {
+            if (taskState.running) { updateStatus('正在执行中，请先停止或等待完成...'); return; }
+            taskState.running = true;
+            taskState.cancelled = false;
+            setButtonsRunning(true);
+
+            Promise.resolve()
+                .then(fn)
+                .catch(function (err) {
+                    if (err && err.__cancelled) {
+                        updateStatus('⏹ 已停止当前操作');
+                    } else {
+                        logDebug('err', '异常：' + (err && err.message ? err.message : err));
+                        console.error('[MOOC互评] 异常', err);
+                        updateStatus('发生异常：' + (err && err.message ? err.message : err));
+                    }
+                })
+                .then(function () {
+                    taskState.running = false;
+                    taskState.cancelled = false;
+                    setButtonsRunning(false);
+                });
+        }
+
+        var reviewCountsEl = document.getElementById('mar-review-counts');
+
+        function resetReviewDeleteMode() {
+            var armed = reviewCountsEl.querySelectorAll('.mar-review-delete');
+            for (var i = 0; i < armed.length; i++) {
+                armed[i].classList.remove('mar-review-delete');
+                armed[i].textContent = '互评 ' + armed[i].dataset.count + ' 份';
+            }
+            return armed.length > 0;
+        }
+
+        function renderReviewCountButtons() {
+            var counts = reviewCounts();
+            reviewCountsEl.innerHTML = '';
+            for (var i = 0; i < counts.length; i++) {
+                (function (count) {
+                    var btn = document.createElement('button');
+                    btn.className = 'mar-btn mar-review-count';
+                    btn.type = 'button';
+                    btn.dataset.count = String(count);
+                    btn.textContent = '互评 ' + count + ' 份';
+                    btn.addEventListener('contextmenu', function (e) {
+                        e.preventDefault();
+                        e.stopPropagation();
+                        if (taskState.running) return;
+                        if (btn.classList.contains('mar-review-delete')) {
+                            resetReviewDeleteMode();
+                            updateStatus('已退出删除模式');
+                            return;
+                        }
+                        resetReviewDeleteMode();
+                        btn.classList.add('mar-review-delete');
+                        btn.textContent = 'delete';
+                        updateStatus('点击红色 delete 删除；再任意右键一次退出');
+                    });
+                    btn.addEventListener('click', function () {
+                        if (btn.classList.contains('mar-review-delete')) {
+                            var next = reviewCounts().filter(function (v) { return v !== count; });
+                            saveReviewCounts(next);
+                            renderReviewCountButtons();
+                            updateStatus('已删除「互评 ' + count + ' 份」按钮');
+                            return;
+                        }
+                        guard(function () { return batchReview(count); });
+                    });
+                    reviewCountsEl.appendChild(btn);
+                })(counts[i]);
+            }
+        }
+
+        document.addEventListener('contextmenu', function (e) {
+            if (!resetReviewDeleteMode()) return;
+            e.preventDefault();
+            updateStatus('已退出删除模式');
+        });
+
+        document.getElementById('mar-review-custom').addEventListener('click', function () {
+            var input = window.prompt('请输入互评份数（1–' + CONFIG.REVIEW_COUNT_MAX + '）：', '6');
+            if (input === null) return;
+            var count = Number(String(input).trim());
+            if (!Number.isInteger(count) || count < 1 || count > CONFIG.REVIEW_COUNT_MAX) {
+                updateStatus('⚠️ 请输入 1–' + CONFIG.REVIEW_COUNT_MAX + ' 之间的整数');
+                return;
+            }
+            var counts = reviewCounts();
+            if (counts.indexOf(count) !== -1) {
+                updateStatus('「互评 ' + count + ' 份」按钮已存在');
+                return;
+            }
+            counts.push(count);
+            saveReviewCounts(counts);
+            renderReviewCountButtons();
+            updateStatus('已添加「互评 ' + count + ' 份」按钮');
+        });
+        renderReviewCountButtons();
+
+        // 日志页签：复制 / 清空 / 展开
+        var logCopy = document.getElementById('mar-log-copy');
+        var logClear = document.getElementById('mar-log-clear');
+        if (logCopy) logCopy.addEventListener('click', copyDebugLogs);
+        if (logClear) logClear.addEventListener('click', clearDebugLogs);
+        var logExpand = document.getElementById('mar-log-expand');
+        if (logExpand) logExpand.addEventListener('click', openLogOverlay);
+        var logTab = document.querySelector('.mar-tab[data-tab="log"]');
+        if (logTab) logTab.addEventListener('click', function () { setTimeout(refreshLogBox, 30); });
+
+        // 视频倍速滑块：拖动即落盘，视频在播的话立即生效
+        var rateInput = document.getElementById('mar-video-rate');
+        var rateNow = document.getElementById('mar-rate-now');
+        if (rateInput && rateNow) {
+            rateInput.value = loadVideoRate();
+            rateNow.textContent = loadVideoRate().toFixed(2).replace(/\.?0+$/, '') + 'x';
+            rateInput.addEventListener('input', function () {
+                var r = parseFloat(rateInput.value) || 1;
+                saveVideoRate(r);
+                rateNow.textContent = r.toFixed(2).replace(/\.?0+$/, '') + 'x';
+                applyVideoRate(findVideo());
+                updateStatus('视频倍速已设为 ' + r + 'x');
+            });
+        }
+
+        // 内容来源的分段控件：点一下就切换并落盘，下次打开面板还是这个选择
+        var segBtns = panel.querySelectorAll('.mar-seg-btn');
+        for (var sb = 0; sb < segBtns.length; sb++) {
+            (function (btn) {
+                btn.addEventListener('click', function () {
+                    setDiscussSource(btn.getAttribute('data-source'));
+                    updateStatus('讨论内容来源已切换为：' + sourceLabel(getDiscussSource()));
+                });
+            })(segBtns[sb]);
+        }
+        updateSourceSeg();
+
+        document.getElementById('mar-stop').addEventListener('click', function () {
+            if (!taskState.running) return;
+            taskState.cancelled = true;
+            // 停止时立刻撤掉弹题拦截，把播放器的暂停控制权还给页面
+            stopPopupGuard();
+            // 新版路径路由跳转会整页刷新，光靠内存里的 cancelled 不够，
+            // 必须同时清掉 localStorage 里的续跑状态，刷新后才会真正停下来
+            learnClearState();
+            setFloatVisible(false);
+            updateStatus('⏹ 正在停止...');
+        });
+
+        // 初始收起停止按钮：面板刚出现时没有任务在跑
+        setButtonsRunning(false);
+    }
+
+    // ===================== 课程类型：MOOC / SPOC =====================
+    // 两类课程共用 www.icourse163.org，但前端是两套东西：
+    //
+    //            MOOC（新版）                              SPOC
+    //   路径      /mooc/learn/{课程}/content/{id}           /spoc/learn/{课程}/…
+    //   内容项    [role="tablist"] 里的 [role="tab"]        .unitslist > .f-fl（.current 为当前）
+    //   章节小节  header button[aria-expanded]              .up.j-up + .down.j-list 的 .list
+    //   题块      LessonQuizUnit 容器 + article             .m-choiceQuestion
+    //   提交/重做 文字「提交」/「重新答题」                   .j-submit / .j-replay（文字「重做」）
+    //   答案      front-mooc-learn/api/…/unit-page          dwr CourseBean.getLessonUnitLearnVo
+    //             → result.quizData.questions               → paper.objectiveQList
+    //   讨论      mooc-comment* + contenteditable           .m-data-lists / .f-richEditorText / .ql-editor
+    //
+    // 原则：所有 SPOC 分支都以 isSpocCourse() 为前提，MOOC 仍走原有代码路径；
+    //       SPOC 分支认不出结构时返回 null，由 MOOC 逻辑兜底，不硬点。
+    var courseUiCache = { key: '', type: '' };
+
+    function isSpocCourse() {
+        return detectCourseUi() === 'spoc';
+    }
+
+    function detectCourseUi() {
+        var key = (location.pathname || '') + (location.hash || '');
+        if (courseUiCache.key === key && courseUiCache.type) return courseUiCache.type;
+        var type = computeCourseUi();
+        courseUiCache = { key: key, type: type };
+        return type;
+    }
+
+    function computeCourseUi() {
+        var path = location.pathname || '';
+        var hash = location.hash || '';
+        // 路径最可靠：SPOC 一定挂在 /spoc/ 下，新版 MOOC 挂在 /mooc/ 下
+        if (/^\/spoc\//.test(path) || /^\/spoc\//.test(hash)) return 'spoc';
+        if (/^\/mooc\//.test(path)) return 'mooc';
+        // 老式 /learn/ 路由、互评页等：只认 SPOC 独有的 .up.j-up 下拉，
+        // 其余一律按 MOOC 处理——宁可漏判 SPOC，也不能把 MOOC 页面带进 SPOC 分支
+        try {
+            if (document.querySelector('.up.j-up')) return 'spoc';
+        } catch (e) { /* ignore */ }
+        return 'mooc';
+    }
+
+    function courseUiLabel() {
+        return detectCourseUi() === 'spoc' ? 'SPOC' : 'MOOC';
+    }
+
+    // —— SPOC 结构选择器 ——
+    var SPOC = {
+        unitItem: ['.unitslist > .f-fl', '.unitslist > [class*="item"]', '[class*="unitslist"] > .f-fl'],
+        quizBlock: ['.m-choiceQuestion', '.j-questionItem'],
+        navWait: 2500,
+    };
+
+    // 当前小节里的内容项（视频/文档/讨论/测试），按页面顺序
+    function spocUnitItems() {
+        for (var s = 0; s < SPOC.unitItem.length; s++) {
+            var els;
+            try { els = document.querySelectorAll(SPOC.unitItem[s]); } catch (e) { continue; }
+            var vis = [];
+            for (var i = 0; i < els.length; i++) {
+                if (isVisible(els[i])) vis.push(els[i]);
+            }
+            if (vis.length > 0) return vis;
+        }
+        return [];
+    }
+
+    function spocCurrentIndex(items) {
+        for (var i = 0; i < items.length; i++) {
+            if (items[i].classList && items[i].classList.contains('current')) return i;
+        }
+        return -1;
+    }
+
+    // 当前页面是否在小节内容页（有内容条 / 内容标签栏）。单元测验、作业是独立页，没有这些。
+    function spocInLessonPage() {
+        try {
+            return !!(document.querySelector('.unitslist, .learn-unit-tabs-scroll, [role="tablist"]'));
+        } catch (e) { return false; }
+    }
+
+    // 等「当前项」移到目标项。SPOC 切内容是 dwr 局部刷新，不换页也不换 hash，
+    // 所以只能盯 .current 的移动来判断是否切换成功。
+    async function spocWaitCurrent(expectText) {
+        var want = cleanText(expectText);
+        var t0 = Date.now();
+        while (Date.now() - t0 < CONFIG.LEARN_NAV_WAIT) {
+            if (taskState.cancelled) throw makeCancelError();
+            var items = spocUnitItems();
+            var idx = spocCurrentIndex(items);
+            if (idx !== -1 && cleanText(items[idx].textContent) === want) return true;
+            await sleep(250);
+        }
+        return false;
+    }
+
+    // 展开第 idx 个下拉（0=章节，1=小节），返回按钮与菜单项
+    async function spocOpenList(idx) {
+        var ups = document.querySelectorAll('.up.j-up');
+        if (ups.length <= idx || !isVisible(ups[idx])) return { btn: null, items: [] };
+        var btn = ups[idx];
+        realClick(btn);
+        await sleep(700);
+        var lists = document.querySelectorAll('.down.j-list');
+        if (lists.length <= idx) return { btn: btn, items: [] };
+        var items = lists[idx].querySelectorAll('.list');
+        return { btn: btn, items: Array.prototype.slice.call(items) };
+    }
+
+    // 下拉按钮的文字形如「4.2.2 依靠人民…」/「第四章 坚持以人民…」，
+    // 菜单项的 title 里含同一段编号，用首个词做匹配（和参考脚本一致）
+    function spocTitleHead(el) {
+        var t = cleanText((el && (el.textContent || (el.getAttribute ? el.getAttribute('title') : ''))) || '');
+        var m = t.match(/^\S+/);
+        return m ? m[0] : t.slice(0, 10);
+    }
+
+    function spocIndexOfList(items, btn) {
+        var head = normMatch(spocTitleHead(btn));
+        if (!head) return -1;
+        for (var i = 0; i < items.length; i++) {
+            var raw = (items[i].getAttribute && items[i].getAttribute('title')) || items[i].textContent || '';
+            if (normMatch(cleanText(raw)).indexOf(head) !== -1) return i;
+        }
+        return -1;
+    }
+
+    // 切换小节/章节后，点第一个内容项（平台通常已自动选中，已是第一项就不重复点）
+    async function spocEnterFirstItem() {
+        await sleep(800);
+        var items = spocUnitItems();
+        if (items.length === 0) return false;
+        if (spocCurrentIndex(items) === 0) return true;
+        var first = items[0];
+        var want = cleanText(first.textContent);
+        realClick(first);
+        return await spocWaitCurrent(want);
+    }
+
+    // SPOC 的“下一项”：同小节下一项 → 下一小节第一项 → 下一章第一项 → 结束
+    // 返回 true=已移动 / false=确实到课程末尾 / null=结构没认出来（交给 MOOC 逻辑兜底）
+    async function spocGoNext() {
+        var items = spocUnitItems();
+        if (items.length === 0) { logDebug('nav', 'SPOC：没找到 .unitslist 内容项'); return null; }
+        var cur = spocCurrentIndex(items);
+        if (cur === -1) { logDebug('nav', 'SPOC：内容项里没有 .current 标记'); return null; }
+        logDebug('nav', 'SPOC：当前第 ' + (cur + 1) + '/' + items.length + ' 项＝「' + cleanText(items[cur].textContent).slice(0, 20) + '」');
+
+        // 1) 同小节下一项
+        if (cur + 1 < items.length) {
+            var next = items[cur + 1];
+            var nextText = cleanText(next.textContent);
+            realClick(next);
+            updateStatus('➡️ SPOC：进入本节下一个内容');
+            var moved = await spocWaitCurrent(nextText);
+            logDebug('nav', 'SPOC 同小节 →「' + nextText.slice(0, 20) + '」' + (moved ? '成功' : '⚠️ 当前项未变化'));
+            return moved;
+        }
+
+        // 2) 跨小节
+        var sec = await spocOpenList(1);
+        if (!sec.btn) { logDebug('nav', 'SPOC：没找到小节下拉按钮'); return null; }
+        var secIdx = spocIndexOfList(sec.items, sec.btn);
+        logDebug('nav', 'SPOC 小节下拉：' + sec.items.length + ' 项，当前索引=' + secIdx);
+        if (secIdx === -1) return null;
+        if (secIdx + 1 < sec.items.length) {
+            var secText = cleanText(sec.items[secIdx + 1].textContent);
+            logDebug('nav', 'SPOC 跨小节目标＝「' + secText.slice(0, 24) + '」');
+            realClick(sec.items[secIdx + 1]);
+            updateStatus('📚 SPOC：进入下一小节，自动播放第一个内容...');
+            await sleep(1200);
+            return await spocEnterFirstItem();
+        }
+
+        // 3) 跨章节
+        var chap = await spocOpenList(0);
+        if (!chap.btn) { logDebug('nav', 'SPOC：没找到章节下拉按钮'); return null; }
+        var chapIdx = spocIndexOfList(chap.items, chap.btn);
+        logDebug('nav', 'SPOC 章节下拉：' + chap.items.length + ' 项，当前索引=' + chapIdx);
+        if (chapIdx === -1) return null;
+        if (chapIdx + 1 >= chap.items.length) { logDebug('nav', 'SPOC：章节已是最后一个 → 课程学完'); return false; }
+        logDebug('nav', 'SPOC 跨章节目标＝「' + cleanText(chap.items[chapIdx + 1].textContent).slice(0, 24) + '」');
+        realClick(chap.items[chapIdx + 1]);
+        updateStatus('📕 SPOC：进入下一章，自动播放第一个内容...');
+        await sleep(1500);
+        // 新章节未必自动选中第一节，点第一节兜底
+        var sec2 = await spocOpenList(1);
+        if (sec2.items.length > 0) {
+            realClick(sec2.items[0]);
+            await sleep(1200);
+        }
+        return await spocEnterFirstItem();
+    }
+
+    // SPOC 内容类型判定。认不出来返回 null，交给通用判定。
+    function spocActiveTabText() {
+        var box = document.querySelector('.learn-unit-tabs-scroll');
+        var scope = box || document;
+        var btns = scope.querySelectorAll('button, [role="tab"]');
+        for (var i = 0; i < btns.length; i++) {
+            var cls = typeof btns[i].className === 'string' ? btns[i].className : '';
+            var active = (btns[i].getAttribute && btns[i].getAttribute('aria-selected') === 'true')
+                || /\bcurrent\b/.test(cls) || /text-\[#00cc7e\]/i.test(cls);
+            if (!active) continue;
+            var t = cleanText(btns[i].textContent || (btns[i].getAttribute && btns[i].getAttribute('aria-label')) || '');
+            if (t) return t;
+        }
+        return '';
+    }
+
+    function spocDetectContentType() {
+        if (hasVisibleQuestionBlocks()) {
+            logDebug('type', 'SPOC：检测到可见题块 → quiz');
+            return 'quiz';
+        }
+        if (document.querySelector('.m-data-lists, .ql-editor, .f-richEditorText')) {
+            logDebug('type', 'SPOC：检测到讨论区结构 → discussion');
+            return 'discussion';
+        }
+        if (findVideo()) { logDebug('type', 'SPOC：检测到 video 元素 → video'); return 'video'; }
+        if (findDocViewer()) { logDebug('type', 'SPOC：检测到文档查看器 → doc'); return 'doc'; }
+        // 最后看标签栏激活项的文字（测试/讨论/视频/课件）
+        var tab = spocActiveTabText();
+        if (tab) {
+            logDebug('type', 'SPOC：标签栏激活项＝「' + tab.slice(0, 12) + '」');
+            if (/测试|测验|考试/.test(tab)) return 'quiz';
+            if (/讨论/.test(tab)) return 'discussion';
+            if (/视频/.test(tab)) return 'video';
+            if (/课件|文档|图文|PPT/i.test(tab)) return 'doc';
+        }
+        logDebug('type', 'SPOC：DOM 特征没认出来，退回通用判定');
+        return null;
+    }
+
+    // —— SPOC 随堂测验的答案来源：dwr ——
+    // 页面里那条 getLessonUnitLearnVo.dwr 请求的返回体带 data.paper.objectiveQList，
+    // 每题有 plainTextTitle / type / optionDtos[{id,answer}] / correctAnswer。
+    // 脚本是 document-idle 注入的，首屏那条请求早已发完，所以：
+    //   ① 先挂 hook 等下一次回调（切换内容必然触发一次）；
+    //   ② 还没等到，就把当前内容重新点一次，逼平台再请求一回。
+    var SPOC_DWR = { paper: null, hooked: false, patched: false, sawRequest: false };
+
+    function spocHookDwr() {
+        if (SPOC_DWR.hooked) return;
+        SPOC_DWR.hooked = true;
+        try {
+            var realOpen = XMLHttpRequest.prototype.open;
+            XMLHttpRequest.prototype.open = function (method, url) {
+                try {
+                    if (typeof url === 'string' && url.indexOf('getLessonUnitLearnVo') !== -1) SPOC_DWR.sawRequest = true;
+                } catch (e) { /* ignore */ }
+                return realOpen.apply(this, arguments);
+            };
+            logDebug('quiz', 'SPOC：XHR 已挂钩（仅用于观测 dwr 请求）');
+        } catch (e) {
+            logDebug('quiz', 'SPOC：XHR 挂钩失败 ' + (e && e.message));
+        }
+        spocPatchDwrEngine(0);
+    }
+
+    // dwr 引擎回调是拿数据最稳的一手：直接给对象，不用解析文本
+    function spocPatchDwrEngine(tries) {
+        try {
+            if (window.dwr && window.dwr.engine && typeof window.dwr.engine._remoteHandleCallback === 'function') {
+                if (!SPOC_DWR.patched) {
+                    var orig = window.dwr.engine._remoteHandleCallback;
+                    window.dwr.engine._remoteHandleCallback = function (id, idx, data) {
+                        try {
+                            if (data && data.paper && data.paper.objectiveQList && data.paper.objectiveQList.length) {
+                                SPOC_DWR.paper = data.paper;
+                                logDebug('quiz', 'SPOC：已捕获 dwr paper（' + data.paper.objectiveQList.length + ' 题）');
+                            }
+                        } catch (e) { /* ignore */ }
+                        return orig.apply(this, arguments);
+                    };
+                    SPOC_DWR.patched = true;
+                    logDebug('quiz', 'SPOC：dwr 引擎回调已挂钩');
+                }
+                return;
+            }
+        } catch (e) { /* ignore */ }
+        if (tries < 20) setTimeout(function () { spocPatchDwrEngine(tries + 1); }, 300);
+    }
+
+    async function spocEnsurePaper(timeoutMs) {
+        if (SPOC_DWR.paper) return true;
+        spocHookDwr();
+        await sleep(400);
+        if (SPOC_DWR.paper) return true;
+
+        // 重新点当前内容，逼平台再发一次 dwr 请求
+        var items = spocUnitItems();
+        var cur = spocCurrentIndex(items);
+        if (cur !== -1) {
+            logDebug('quiz', 'SPOC：重新点击当前内容项以触发 dwr 请求');
+            realClick(items[cur]);
+        }
+        var t0 = Date.now();
+        while (Date.now() - t0 < timeoutMs) {
+            if (taskState.cancelled) throw makeCancelError();
+            if (SPOC_DWR.paper) return true;
+            await sleep(300);
+        }
+        return !!SPOC_DWR.paper;
+    }
+
+    // dwr 里的布尔字段未必真是 boolean：icourse163 常见 "true"/"false" 字符串、1/0 数字，
+    // 也可能改用 right / selected 之类的别名。写成 `o.answer === true` 会把正确答案全丢掉，
+    // 表现出来就是「题对上了但一个选项都没勾」。
+    function lqTruthy(v) {
+        if (v === true) return true;
+        if (v === false || v === null || v === undefined) return false;
+        if (typeof v === 'number') return v !== 0;
+        var s = String(v).trim().toLowerCase();
+        return s === 'true' || s === 't' || s === 'y' || s === 'yes' || s === '1';
+    }
+
+    // 按优先级取第一个有值的字段
+    function lqPick(o, keys, dft) {
+        if (!o) return dft;
+        for (var i = 0; i < keys.length; i++) {
+            var v = o[keys[i]];
+            if (v !== null && v !== undefined && v !== '') return v;
+        }
+        return dft;
+    }
+
+    // 选项数组的字段名各版式都不同，挨个试
+    function lqOptionArray(q) {
+        var v = lqPick(q, [
+            'optionDtos', 'options', 'optionList', 'optionVoList', 'optionDtoList',
+            'questionOptions', 'optionDto', 'items',
+        ], null);
+        if (v && !Array.isArray(v) && typeof v === 'object') v = [v];
+        return Array.isArray(v) ? v : [];
+    }
+
+    // "A" / "AB" / "A,B" / "（A）" → [0] / [0,1]
+    // SPOC 的 correctAnswer 常常只给选项字母，不给选项 ID。
+    function lqLettersToIndexes(raw, count) {
+        var out = [];
+        var m = String(raw === null || raw === undefined ? '' : raw).toUpperCase().match(/[A-H]/g);
+        if (!m) return out;
+        for (var i = 0; i < m.length; i++) {
+            var idx = m[i].charCodeAt(0) - 65;
+            if (idx < 0) continue;
+            if (count && idx >= count) continue;
+            if (out.indexOf(idx) === -1) out.push(idx);
+        }
+        return out;
+    }
+
+    var LQ_OPT_ID_KEYS = ['id', 'optionId', 'oid', 'optionID'];
+    var LQ_OPT_TEXT_KEYS = ['content', 'label', 'title', 'optionContent', 'text', 'optionTitle'];
+    var LQ_TITLE_KEYS = [
+        'plainTextTitle', 'title', 'content', 'stem', 'questionTitle',
+        'contentTitle', 'questionContent', 'name', 'description',
+    ];
+
+    function spocParsePaper(paper) {
+        var list = paper && (paper.objectiveQList || paper.questionList || paper.questionVoList);
+        if (!list || !list.length) return [];
+        var out = [];
+        for (var i = 0; i < list.length; i++) {
+            var q = list[i];
+            if (!q) continue;
+            var opts = lqOptionArray(q);
+            var ids = [], labels = [], letters = [], allLabels = [];
+            var j, o, oid, otext;
+
+            for (j = 0; j < opts.length; j++) {
+                o = opts[j];
+                if (!o) continue;
+                otext = lqStripTags(lqPick(o, LQ_OPT_TEXT_KEYS, ''));
+                if (cleanText(otext)) allLabels.push(otext);
+                var flag = lqPick(o, ['answer', 'isAnswer', 'correct', 'right', 'correctFlag', 'isCorrect'], false);
+                if (!lqTruthy(flag)) continue;
+                oid = lqPick(o, LQ_OPT_ID_KEYS, null);
+                if (oid !== null) ids.push(String(oid));
+                letters.push(String.fromCharCode(65 + j));
+                if (cleanText(otext)) labels.push(otext);
+            }
+
+            var ca = lqPick(q, ['correctAnswer', 'standardAnswer', 'answer', 'rightAnswer', 'key'], '');
+
+            // 兜底一：correctAnswer 是字母形态，按选项下标映射
+            if (ids.length === 0 && labels.length === 0 && ca) {
+                var idxs = lqLettersToIndexes(lqStripTags(ca), opts.length);
+                for (j = 0; j < idxs.length; j++) {
+                    letters.push(String.fromCharCode(65 + idxs[j]));
+                    var oo = opts[idxs[j]];
+                    if (!oo) continue;
+                    oid = lqPick(oo, LQ_OPT_ID_KEYS, null);
+                    if (oid !== null) ids.push(String(oid));
+                    otext = lqStripTags(lqPick(oo, LQ_OPT_TEXT_KEYS, ''));
+                    if (cleanText(otext)) labels.push(otext);
+                }
+            }
+
+            // 兜底二：correctAnswer 直接写的是选项文案（少数课程会这么存）
+            if (ids.length === 0 && labels.length === 0 && ca) {
+                var flat = lqKey(lqStripTags(ca));
+                if (flat) {
+                    for (j = 0; j < allLabels.length; j++) {
+                        var cand = lqOptKey(allLabels[j]);
+                        if (cand && (cand === flat || flat.indexOf(cand) !== -1)) {
+                            labels.push(allLabels[j]);
+                            oid = lqPick(opts[j], LQ_OPT_ID_KEYS, null);
+                            if (oid !== null) ids.push(String(oid));
+                        }
+                    }
+                }
+            }
+
+            var blanks = [];
+            if (ca && ids.length === 0 && labels.length === 0) {
+                var segs = lqStripTags(ca).split('#');
+                for (var s = 0; s < segs.length; s++) {
+                    var seg = cleanText(segs[s]);
+                    if (seg) blanks.push(seg);
+                }
+            }
+            // 有的 SPOC 试卷把填空答案放在 correctOptionList / answers 里
+            if (blanks.length === 0 && ids.length === 0 && labels.length === 0) blanks = lqBlankAnswersFrom(q);
+
+            out.push({
+                type: lqPick(q, ['type', 'questionType', 'typeId'], ''),
+                title: lqStripTags(lqPick(q, LQ_TITLE_KEYS, '')),
+                ids: ids,
+                labels: labels,
+                letters: letters,
+                allLabels: allLabels,
+                blanks: blanks,
+            });
+        }
+        return out;
+    }
+
+    // ===================== 随堂测验：一键完成并提交 =====================
+    // 随堂测验（新版 UI 里就那个叫「测试」的 tab，组件名 LessonQuizUnit）和单元测验
+    // 是两套不同的东西：
+    //   随堂测验 —— 和视频/文档/讨论同一层，嵌在小节里，通常不限次数；
+    //   单元测验 —— 左侧目录里单独一个节点，往往只有一次机会。
+    // 所以本模块只在明确认出「随堂测验」版式时才动手，而且拿不到答案就一个选项都不点、
+    // 也不提交。随堂测验可以重做，但把单元测验/考试的选项乱点一通是收不回来的。
+    //
+    // 答案来源：站点自己的课件接口（F12 网络面板里搜题面看到的那条 unit-page 请求就是它）
+    //   /front-mooc-learn/api/learn/content/unit-page?courseKey=..&termId=..&lessonId=..&unitId=..
+    // 返回的 result.quizData.questions 里，每题有 options[{id,label}] 和 correctOptionIds，
+    // 把 correctOptionIds 映射回 options[].label 就是正确选项的文案，再拿文案去匹配页面上
+    // 每个 label 的文字。
+    //
+    // 为什么以文案为主、ID 为辅：页面 DOM 里 input 的 id 常被平台加前缀（_102476797525894），
+    // 而不同选项的 id 可能互为后缀——比如 102476797525894 正好是 1102476797525894 的结尾，
+    // 用 indexOf/includes 比对 ID 会误命中，必须整段相等才算。
+    var LESSON_QUIZ = {
+        API: '/front-mooc-learn/api/learn/content/unit-page',
+        // 随堂测验容器：命中任一即认为是这个版式
+        scopeSelectors: [
+            '[class*="LessonQuizUnit"]', '[class*="lesson-quiz"]', '[class*="lessonQuiz"]',
+            '[class*="LessonQuiz"]', '[class*="quiz-unit"]', '[class*="quizUnit"]',
+        ],
+        // 单题容器（SPOC 的随堂测验题块是 .m-choiceQuestion）
+        // 填空题的容器类名五花八门（m-fillblankQuestion / fillBlankItem / blank-item…），
+        // 认不出来就只当成「页面少渲染了一题」，最后卡在「不提交」。这里一并列上。
+        blockSelectors: [
+            'article', 'fieldset', '.m-choiceQuestion', '.m-fillblankQuestion', '.j-questionItem',
+            '[class*="questionItem"]', '[class*="question-item"]', '[class*="questionBlock"]',
+            '[class*="fillblank"]', '[class*="fillBlank"]', '[class*="fill-blank"]',
+            '[class*="blankItem"]', '[class*="blank-item"]',
+        ],
+        MAX_BLOCKS: 60,
+        SUBMIT_TEXT: /^(提交|提交答案|提交试卷|交卷)$/,
+        RE_ANSWER_TEXT: /^(重新答题|重做|再做一次|重新开始)$/,
+    };
+
+    // 去标签。接口里的 title/label 都是 HTML 片段（<p>…</p>）
+    function lqStripTags(s) {
+        return String(s === null || s === undefined ? '' : s)
+            .replace(/<[^>]*>/g, ' ')
+            .replace(/&nbsp;/gi, ' ')
+            .replace(/&lt;/gi, '<')
+            .replace(/&gt;/gi, '>')
+            .replace(/&amp;/gi, '&');
+    }
+
+    // 比对用的归一化：只留汉字/字母/数字，去掉标点、空白、题号前缀。
+    // 页面上题面常带「1.」「（2分）」「单选题」这类杂讯，接口标题又是 HTML，
+    // 两边都不是干净字符串，不归一化基本对不上。
+    function lqKey(s) {
+        return lqStripTags(s).replace(/[^\u4e00-\u9fffa-zA-Z0-9]/g, '').toLowerCase();
+    }
+
+    // 从地址栏凑出接口参数。新版路径路由带 tid/unitId；
+    // 缺了就从目录里指向同一课件的链接上补——参数不全接口会报课件不存在。
+    function lqContext() {
+        var path = location.pathname;
+        var search = String(location.search || '').replace(/^\?/, '');
+        var hash = location.hash || '';
+        var ctx = { courseKey: null, lessonId: null, termId: null, unitId: null, entryMode: 'learn' };
+        var m, sp;
+
+        m = path.match(/\/(?:mooc|spoc)\/learn\/([^\/?#]+)/);
+        if (m) ctx.courseKey = decodeURIComponent(m[1]);
+
+        m = path.match(/\/content\/(\d+)/);
+        if (m) ctx.lessonId = m[1];
+        if (!ctx.lessonId) { m = hash.match(/[?&]id=(\d+)/); if (m) ctx.lessonId = m[1]; }
+
+        function takeParams(qs) {
+            if (!qs) return;
+            try { sp = new URLSearchParams(qs); } catch (e) { return; }
+            if (!ctx.termId) ctx.termId = sp.get('tid') || sp.get('termId');
+            if (!ctx.unitId) ctx.unitId = sp.get('unitId');
+            var em = sp.get('entryMode');
+            if (em) ctx.entryMode = em;
+        }
+        takeParams(search);
+        if (hash.indexOf('?') !== -1) takeParams(hash.slice(hash.indexOf('?') + 1));
+
+        if (ctx.lessonId && (!ctx.unitId || !ctx.termId)) {
+            var links = document.querySelectorAll('a[href]');
+            for (var i = 0; i < links.length; i++) {
+                var href = links[i].getAttribute('href') || '';
+                if (href.indexOf(String(ctx.lessonId)) === -1) continue;
+                try {
+                    takeParams(new URL(href, location.href).search.replace(/^\?/, ''));
+                } catch (e) { /* 相对地址解析失败就跳过 */ }
+                if (ctx.unitId && ctx.termId) break;
+            }
+        }
+        return ctx;
+    }
+
+    function lqScope() {
+        var hits = collectCandidates(document, LESSON_QUIZ.scopeSelectors, 20);
+        var hasInput = 'input[type="radio"], input[type="checkbox"], input[type="text"], textarea';
+        for (var i = 0; i < hits.length; i++) {
+            if (!isVisible(hits[i])) continue;
+            if (hits[i].querySelector(hasInput)) return hits[i];
+        }
+        return null;
+    }
+
+    // 同一题可能同时命中多个容器（比如 .m-choiceQuestion 里还套着 article），
+    // 只保留最内层——最内层刚好是「一题的范围」，外层可能罩着好几题。
+    // 不去重的话同一题会被当成两个题块，第二个必然匹配不上，于是永远不提交。
+    function lqKeepInnermost(list) {
+        var out = [];
+        for (var i = 0; i < list.length; i++) {
+            var hasInner = false;
+            for (var j = 0; j < list.length; j++) {
+                if (j !== i && list[i] !== list[j] && list[i].contains(list[j])) { hasInner = true; break; }
+            }
+            if (!hasInner) out.push(list[i]);
+        }
+        return out;
+    }
+
+    // 页面上的题目区块。优先 article/fieldset；没有就从选项输入框往上爬，
+    // 爬到「同一题的所有选项」那个容器为止。
+    // 填空题没有单选/多选，只有输入框——所以最后还要单独捞一遍「纯填空块」，
+    // 否则一整套题里只要有一道填空，题块数就会比接口少一题，最终卡在「不提交」。
+    function lqBlocks(scope) {
+        var root = scope || document;
+        var out = [];
+        // 文本类 input 也要算：平台经常不写 type 属性（默认就是 text），
+        // 只认 input[type="text"] 会把填空框一个都匹配不到。
+        var inputSel = 'input[type="radio"], input[type="checkbox"], input[type="text"], textarea, input:not([type])';
+        var shapeSel = 'input[type="radio"], input[type="checkbox"]';
+        var cands = collectCandidates(root, LESSON_QUIZ.blockSelectors, LESSON_QUIZ.MAX_BLOCKS * 4);
+        var i;
+
+        for (i = 0; i < cands.length && out.length < LESSON_QUIZ.MAX_BLOCKS; i++) {
+            var el = cands[i];
+            if (!isVisible(el)) continue;
+            if (el.closest && el.closest('#mooc-auto-review-panel, #mar-probe-overlay, #mar-help-overlay, #mar-log-overlay')) continue;
+            // 富文本只认「像填空」的那种，且不能在讨论/评论区里（否则回复框会算成一道题）
+            if (!el.querySelector(inputSel) && !lqHasBlankEditor(el)) continue;
+            // 讨论/评论区的富文本编辑器不是题块
+            if (lqLooksLikeCommentBox(el)) continue;
+            // 老版单元测验/作业的题块，明确不碰
+            if (el.querySelector('.u-questionItem')) continue;
+            if (out.indexOf(el) === -1) out.push(el);
+        }
+        if (out.length > 0) return lqKeepInnermost(withBlankBlocks(out, root));
+
+        var inputs = root.querySelectorAll(shapeSel);
+        var seen = [];
+
+        // 兜底一：按 name 分组。单选/多选的同题选项一定共用一个 name，
+        // 这比「往上爬到含 2 个 input 的祖先」可靠得多——SPOC 的选项常常平铺在
+        // 一个 .j-list 里，往上爬会把整页的题并成一题（题干糊成一大坨，必然匹配不上）。
+        var byName = {}, order = [];
+        for (i = 0; i < inputs.length; i++) {
+            var nm = inputs[i].getAttribute && inputs[i].getAttribute('name');
+            if (!nm) continue;
+            if (!byName[nm]) { byName[nm] = []; order.push(nm); }
+            byName[nm].push(inputs[i]);
+        }
+        for (var n = 0; n < order.length && out.length < LESSON_QUIZ.MAX_BLOCKS; n++) {
+            var group = byName[order[n]];
+            if (group.length < 2) continue;
+            var wrapEl = lqCommonAncestor(group);
+            if (!wrapEl || seen.indexOf(wrapEl) !== -1) continue;
+            if (!isVisible(wrapEl)) continue;
+            if (wrapEl.querySelector('.u-questionItem')) continue;
+            // 这个祖先里若混进了别的 name，说明分组太粗，宁可不认
+            if (lqDistinctNames(wrapEl, shapeSel) > 1) continue;
+            seen.push(wrapEl);
+            out.push(wrapEl);
+        }
+        if (out.length > 0) return lqKeepInnermost(withBlankBlocks(out, root));
+
+        // 兜底二：从输入框往上爬，爬到「同一题的所有选项」那个容器为止
+        for (i = 0; i < inputs.length && out.length < LESSON_QUIZ.MAX_BLOCKS; i++) {
+            if (!isVisible(inputs[i])) continue;
+            var node = inputs[i].parentElement, hops = 0;
+            while (node && hops < 8) {
+                if (node.querySelectorAll(shapeSel).length >= 2) break;
+                node = node.parentElement;
+                hops++;
+            }
+            if (!node || seen.indexOf(node) !== -1) continue;
+            if (node.querySelector('.u-questionItem')) continue;
+            seen.push(node);
+            out.push(node);
+        }
+        return lqKeepInnermost(withBlankBlocks(out, root));
+    }
+
+    // 把「纯填空块」并进已有题块列表。
+    // 只并进还没被覆盖、也不包含已有题块的那些（避免把整卷当成一题）。
+    function withBlankBlocks(blocks, root) {
+        var out = blocks.slice();
+        var blanks = lqBlankBlocks(root || document);
+        for (var i = 0; i < blanks.length; i++) {
+            var b = blanks[i];
+            if (out.indexOf(b) !== -1) continue;
+            var covered = false;
+            for (var j = 0; j < out.length; j++) {
+                if (out[j] === b) { covered = true; break; }
+                // 已经算过一题的容器里，别再塞一个更小的分割
+                if (out[j].contains(b)) { covered = true; break; }
+                // b 罩住了已有题块：说明 b 是整个卷子/整节，不是一题
+                if (b.contains(out[j])) { covered = true; break; }
+            }
+            if (!covered) out.push(b);
+        }
+        return out;
+    }
+
+    // 一组节点的最近公共祖先
+    function lqCommonAncestor(nodes) {
+        if (!nodes || !nodes.length) return null;
+        var node = nodes[0].parentElement;
+        while (node) {
+            var all = true;
+            for (var i = 0; i < nodes.length; i++) {
+                if (!node.contains(nodes[i])) { all = false; break; }
+            }
+            if (all) return node;
+            node = node.parentElement;
+        }
+        return null;
+    }
+
+    function lqDistinctNames(el, sel) {
+        var list = el.querySelectorAll(sel);
+        var names = [];
+        for (var i = 0; i < list.length; i++) {
+            var nm = list[i].getAttribute && list[i].getAttribute('name');
+            if (nm && names.indexOf(nm) === -1) names.push(nm);
+        }
+        return names.length;
+    }
+
+    // 题干：把选项整个摘掉，剩下的才是题面。
+    // 删节点删不干净的地方（选项是裸 <li>、没有 label 也没 class），
+    // 再按选项文案做一次字符串减法——不然后半截选项混进题干，
+    // 归一化后和接口标题差几千字，匹配必然失败。
+    function lqBlockText(block) {
+        var clone = block.cloneNode(true);
+        var drop = clone.querySelectorAll(
+            'label, input, textarea, button, select, option, ' +
+            '[class*="option"], [class*="Option"], [class*="answer"], [class*="Answer"]'
+        );
+        for (var i = drop.length - 1; i >= 0; i--) {
+            if (drop[i].parentNode) drop[i].parentNode.removeChild(drop[i]);
+        }
+        var text = cleanText(clone.textContent || '');
+
+        var opts = lqOptions(block);
+        for (var j = 0; j < opts.length; j++) {
+            var t = cleanText(opts[j].text);
+            if (!t || t.length < 2) continue;
+            var at = text.indexOf(t);
+            if (at !== -1) text = cleanText(text.slice(0, at) + ' ' + text.slice(at + t.length));
+        }
+        return text;
+    }
+
+    function lqOptionText(el) {
+        if (!el) return '';
+        var clone = el.cloneNode(true);
+        var ins = clone.querySelectorAll('input');
+        for (var i = 0; i < ins.length; i++) {
+            if (ins[i].parentNode) ins[i].parentNode.removeChild(ins[i]);
+        }
+        return cleanText(clone.textContent || '');
+    }
+
+    function lqOptions(block) {
+        var out = [];
+        var seen = [];
+        var i;
+
+        function add(el, input, text) {
+            if (!el || !input) return;
+            if (seen.indexOf(el) !== -1) return;
+            seen.push(el);
+            out.push({ el: el, input: input, text: text });
+        }
+
+        var labels = block.querySelectorAll('label');
+        for (i = 0; i < labels.length; i++) {
+            var lb = labels[i];
+            // 只判 label 可见，不判 input：SPOC 常把原生 radio 设成 opacity:0 盖一层假图标，
+            // 按 input 判会把整题的选项全丢掉。
+            if (!isVisible(lb)) continue;
+            var input = lb.querySelector('input');
+            if (!input) {
+                var forId = lb.getAttribute('for');
+                if (forId) {
+                    try { input = block.querySelector('[id="' + CSS.escape(forId) + '"]') || document.getElementById(forId); }
+                    catch (e) { input = document.getElementById(forId); }
+                }
+            }
+            if (!input) continue;
+            add(lb, input, lqOptionText(lb));
+        }
+        if (out.length > 0) return out;
+
+        // 有的版式把 input 放在 label 外面（或者干脆没有 label）
+        var inputs = block.querySelectorAll('input[type="radio"], input[type="checkbox"]');
+        for (i = 0; i < inputs.length; i++) {
+            var inp = inputs[i];
+            if (inp.disabled) continue;
+            var wrap = lqWrapOfInput(inp);
+            if (!wrap || !isVisible(wrap)) continue;
+            var txt = lqOptionText(wrap);
+            // 文字可能在兄弟节点里（input + span 并排）
+            if (!cleanText(txt) && wrap.nextElementSibling) txt = lqOptionText(wrap.nextElementSibling);
+            if (!cleanText(txt) && wrap.parentElement) txt = lqOptionText(wrap.parentElement);
+            add(wrap, inp, txt);
+        }
+        return out;
+    }
+
+    // 「这一个选项」的容器：从 input 往上走，取第一个只包含它自己一个选择型 input 的祖先。
+    // 直接 closest('li') 会把「一题 = 一个 li、四个选项都在里面」的版式拼成一坨文案。
+    function lqWrapOfInput(inp) {
+        var sel = 'input[type="radio"], input[type="checkbox"]';
+        var node = inp.parentElement, hops = 0;
+        while (node && hops < 4) {
+            if (node.querySelectorAll(sel).length <= 1) return node;
+            node = node.parentElement;
+            hops++;
+        }
+        return (inp.closest && inp.closest('label, li, dd, .option, [class*="option"], [class*="Option"]'))
+            || inp.parentElement;
+    }
+
+    // 选项文案比对用的归一化：先剥掉开头的选项字母/序号（A. / （A） / 1、）再归一化。
+    // 接口 label 常常不带字母，页面却渲染成「A、xxx」，不剥前缀就永远差一点。
+    function lqOptKey(s) {
+        var t = lqStripTags(s);
+        t = t.replace(/^[\s\(（\[【]*[A-Ha-h][\s\)）\]】\.、,，:：．]*/, '');
+        t = t.replace(/^[\s\(（\[【]*\d{1,2}[\s\)）\]】\.、,，:：．]+/, '');
+        return lqKey(t);
+    }
+
+    // 选项自带的字母前缀（页面上「A、」「B.」的那种）
+    function lqOptionLeadLetter(text) {
+        var m = cleanText(text).match(/^[\s\(（\[【]*([A-Ha-h])(?=[\s\)）\]】\.、,，:：．]|$)/);
+        return m ? m[1].toUpperCase() : '';
+    }
+
+    // input 上所有可能是「平台选项 ID」的数字段。要求整段比对：
+    // 见模块开头那条后缀陷阱，这里绝不能退化成 includes。
+    function lqIdTokens(input) {
+        if (!input) return [];
+        var vals = [input.id, input.name, input.value];
+        var attrs = ['data-option-id', 'data-optionid', 'data-id', 'data-value'];
+        for (var i = 0; i < attrs.length; i++) {
+            var v = input.getAttribute ? input.getAttribute(attrs[i]) : null;
+            if (v) vals.push(v);
+        }
+        var out = [];
+        for (var j = 0; j < vals.length; j++) {
+            var parts = String(vals[j] === null || vals[j] === undefined ? '' : vals[j]).split(/[^0-9]+/);
+            for (var k = 0; k < parts.length; k++) {
+                if (parts[k] && parts[k].length >= 6 && out.indexOf(parts[k]) === -1) out.push(parts[k]);
+            }
+        }
+        return out;
+    }
+
+    // ===================== 填空题 =====================
+    // 随堂测验里除了单选/多选/判断，还有填空题：没有选项、只有输入框，
+    // 答案在接口的 correctOptionList / answers / correctAnswer 里。
+    // 老版本只认 correctAnswer，遇到新版接口就是「答案取不到 → 整卷不提交」。
+
+    var LQ_BLANK_SEL = 'textarea, input, [contenteditable="true"]';
+
+    // 这个输入框能不能填（排除单选/多选/隐藏/按钮类）
+    function lqIsFillable(el) {
+        if (!el || !isVisible(el)) return false;
+        if (el.disabled || el.readOnly) return false;
+        var tag = el.tagName;
+        if (tag === 'TEXTAREA') return true;
+        if (tag === 'INPUT') {
+            var ty = String((el.getAttribute && el.getAttribute('type')) || 'text').toLowerCase();
+            if (ty === 'radio' || ty === 'checkbox' || ty === 'hidden' || ty === 'file' ||
+                ty === 'submit' || ty === 'button' || ty === 'reset' || ty === 'image') return false;
+            return true;
+        }
+        if (el.isContentEditable || (el.getAttribute && el.getAttribute('contenteditable') === 'true')) {
+            // 富文本编辑器只在「像填空」的容器里认，否则会把讨论区回复框当成题目
+            if (lqLooksLikeCommentBox(el)) return false;
+            return lqIsBlankish(el);
+        }
+        return false;
+    }
+
+    function lqIsBlankish(el) {
+        var host = null;
+        try {
+            host = el.closest && el.closest('[class*="blank"], [class*="Blank"], [class*="fill"], [class*="Fill"], [class*="question"], [class*="Question"], article');
+        } catch (e) { host = null; }
+        if (host) return true;
+        var ph = (el.getAttribute && (el.getAttribute('placeholder') || el.getAttribute('data-placeholder'))) || '';
+        return /填空|答案|请填|请输入/.test(ph);
+    }
+
+    // 讨论区 / 评论区的富文本不是题目，别把回复框当填空框填了
+    function lqLooksLikeCommentBox(node) {
+        if (!node || !node.closest) return false;
+        try {
+            return !!node.closest('[class*="comment"], [class*="Comment"], [class*="forum"], [class*="Forum"], ' +
+                '[class*="discuss"], [class*="Discuss"], [class*="reply"], [class*="Reply"]');
+        } catch (e) { return false; }
+    }
+
+    function lqBlankFields(block) {
+        var out = [];
+        if (!block) return out;
+        var raw;
+        try { raw = block.querySelectorAll(LQ_BLANK_SEL); } catch (e) { return out; }
+        for (var i = 0; i < raw.length; i++) {
+            if (!lqIsFillable(raw[i])) continue;
+            if (out.indexOf(raw[i]) === -1) out.push(raw[i]);
+        }
+        return out;
+    }
+
+    // 题块里有没有「能填的富文本空」——讨论区的回复框不算
+    function lqHasBlankEditor(el) {
+        if (!el) return false;
+        var eds;
+        try { eds = el.querySelectorAll('[contenteditable="true"]'); } catch (e) { return false; }
+        for (var i = 0; i < eds.length; i++) {
+            if (lqIsFillable(eds[i])) return true;
+        }
+        return false;
+    }
+
+    function lqFieldValue(el) {
+        if (!el) return '';
+        if (typeof el.value === 'string') return el.value;
+        return el.textContent || '';
+    }
+
+    // 写入一个填空框。原生 input 走 setNativeValue（React/Vue 能收到变更），
+    // contenteditable 只能改 textContent 再补发 input/change 事件。
+    function lqSetBlank(el, text) {
+        if (!el) return;
+        var val = String(text === null || text === undefined ? '' : text);
+        if (el.isContentEditable || (el.getAttribute && el.getAttribute('contenteditable') === 'true')) {
+            try { el.focus(); } catch (e) {}
+            el.textContent = val;
+            try {
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            } catch (e) { /* jsdom 之类环境不发事件也无所谓 */ }
+            return;
+        }
+        setNativeValue(el, val);
+        try { el.dispatchEvent(new Event('change', { bubbles: true })); } catch (e) {}
+    }
+
+    function lqSameText(a, b) {
+        if (lqKey(a) === lqKey(b)) return true;
+        return cleanText(a) === cleanText(b);
+    }
+
+    function isFillBlankQuestion(q) {
+        if (!q) return false;
+        var t = String(q.type === null || q.type === undefined ? '' : q.type);
+        return t === '3' || /COMPLETION|FILLBLANK|FILL_BLANK|BLANK/i.test(t) || !!(q.blanks && q.blanks.length);
+    }
+
+    // 一个填空框属于哪一题：优先题目容器，其次往上爬到一个「只含这一处输入、
+    // 且有题干文字」的祖先。爬过头会把整卷当成一题，所以带长度与数量上限。
+    function lqBlankHost(field, root) {
+        if (!field) return null;
+        var host = null;
+        try {
+            host = field.closest('article, fieldset, .m-fillblankQuestion, .m-choiceQuestion, ' +
+                '[class*="fillblank"], [class*="fillBlank"], [class*="fill-blank"], ' +
+                '[class*="blankItem"], [class*="blank-item"], [class*="question"], [class*="Question"], li');
+        } catch (e) { host = null; }
+        if (host && host !== root && host !== document.body) {
+            var ht = cleanText(host.textContent || '');
+            // 容器太大（超过 600 字）说明爬到了整卷/整节，退回逐框爬
+            if (ht.length >= 4 && ht.length <= 600) return host;
+        }
+        var node = field.parentElement, hops = 0;
+        while (node && hops < 6 && node !== root) {
+            if (node.querySelectorAll(LQ_BLANK_SEL).length > 1) break;
+            if (cleanText(node.textContent || '').length >= 4) return node;
+            node = node.parentElement;
+            hops++;
+        }
+        return null;
+    }
+
+    // 当前页面/容器像不像「答题环境」。用来给填空识别兜底：
+    // 讨论区也有输入框，但没有这些字样，别在那上面瞎填。
+    function lqQuizEnvOk(root) {
+        if (root && root !== document) return true;
+        try {
+            if (contentKindFromTab(currentContentTab()) === 'quiz') return true;
+        } catch (e) { /* ignore */ }
+        if (PAGE_CONFIG.quizUrl.test(location.href)) return true;
+        var head = cleanText((document.body ? document.body.textContent : '') || '').slice(0, 4000);
+        return /随堂测验|单选题|多选题|判断题|填空题|请选择|提交答案|作答/.test(head);
+    }
+
+    // 只有输入框、没有选项的「填空题块」
+    function lqBlankBlocks(root) {
+        var rootEl = root || document;
+        if (!lqQuizEnvOk(rootEl)) return [];
+        var out = [];
+        var fields = [];
+        var raw;
+        try { raw = rootEl.querySelectorAll(LQ_BLANK_SEL); } catch (e) { return out; }
+        for (var i = 0; i < raw.length; i++) {
+            if (!lqIsFillable(raw[i])) continue;
+            if (lqLooksLikeCommentBox(raw[i])) continue;
+            fields.push(raw[i]);
+        }
+        for (var j = 0; j < fields.length && out.length < LESSON_QUIZ.MAX_BLOCKS; j++) {
+            var host = lqBlankHost(fields[j], rootEl);
+            if (!host) continue;
+            if (lqLooksLikeCommentBox(host)) continue;
+            // 容器里有单选/多选 → 那是选择题，交给上面的逻辑，不重复算一题
+            if (host.querySelector('input[type="radio"], input[type="checkbox"]')) continue;
+            if (out.indexOf(host) === -1) out.push(host);
+        }
+        return out;
+    }
+
+    // 填空题答案的字段名，按可靠度排：新版 MOOC 给 correctOptionList，
+    // 老版给 correctAnswer（「答案#解析」），SPOC 的 dwr 给 answers / answerList。
+    var LQ_BLANK_KEYS = ['correctOptionList', 'correctAnswers', 'answerList', 'answers',
+        'blankAnswers', 'blankList', 'standardAnswer', 'correctAnswer', 'answer'];
+
+    function lqPushBlank(out, v, depth) {
+        if (v === null || v === undefined || depth > 3) return;
+        if (Object.prototype.toString.call(v) === '[object Array]') {
+            for (var i = 0; i < v.length; i++) lqPushBlank(out, v[i], depth + 1);
+            return;
+        }
+        if (typeof v === 'object') {
+            lqPushBlank(out, lqPick(v, ['label', 'text', 'content', 'answer', 'value', 'title', 'blank'], ''), depth + 1);
+            return;
+        }
+        var s = cleanText(lqStripTags(String(v)));
+        if (!s) return;
+        // 多空用 # 分段；但「答案#解析」里的解析段不该当成第二个空
+        var segs = s.split('#');
+        for (var j = 0; j < segs.length; j++) {
+            var seg = cleanText(segs[j]);
+            if (!seg) continue;
+            if (/^[【\[\(（]?\s*(解析|分析|说明|点评|答案)/.test(seg)) continue;
+            out.push(seg);
+        }
+    }
+
+    function lqBlankAnswersFrom(q) {
+        for (var i = 0; i < LQ_BLANK_KEYS.length; i++) {
+            var out = [];
+            lqPushBlank(out, q[LQ_BLANK_KEYS[i]], 0);
+            if (out.length) return out;
+        }
+        return [];
+    }
+
+    function lqParseApiQuestion(q) {
+        if (!q) return null;
+        var opts = q.options || q.optionList || [];
+        var rawIds = q.correctOptionIds || q.correctOptionId || [];
+        if (typeof rawIds === 'string') rawIds = rawIds.split(/[,\s]+/);
+        var ids = [], labels = [], letters = [], allLabels = [], i, j;
+
+        for (i = 0; i < opts.length; i++) {
+            var t = lqStripTags(lqPick(opts[i], LQ_OPT_TEXT_KEYS, ''));
+            if (cleanText(t)) allLabels.push(t);
+        }
+
+        if (rawIds && rawIds.length) {
+            for (i = 0; i < rawIds.length; i++) {
+                if (rawIds[i] !== null && rawIds[i] !== undefined && rawIds[i] !== '') ids.push(String(rawIds[i]));
+            }
+        }
+        for (i = 0; i < ids.length; i++) {
+            for (j = 0; j < opts.length; j++) {
+                if (String(opts[j].id) === ids[i]) {
+                    labels.push(lqStripTags(lqPick(opts[j], LQ_OPT_TEXT_KEYS, '')));
+                    letters.push(String.fromCharCode(65 + j));
+                    break;
+                }
+            }
+        }
+        // 有的接口不给 correctOptionIds，只在选项上打 answer 标记
+        if (labels.length === 0) {
+            for (i = 0; i < opts.length; i++) {
+                var o = opts[i];
+                if (!o) continue;
+                var flag = lqPick(o, ['answer', 'isAnswer', 'correct', 'right', 'correctFlag', 'isCorrect'], false);
+                if (!lqTruthy(flag)) continue;
+                labels.push(lqStripTags(lqPick(o, LQ_OPT_TEXT_KEYS, '')));
+                letters.push(String.fromCharCode(65 + i));
+                if (o.id) ids.push(String(o.id));
+            }
+        }
+        // 填空题：新版接口给 correctOptionList（数组），老版给 correctAnswer（「答案#解析」）。
+        // 只认老字段的话，新版页面的填空题永远是「没答案」，整卷就不交了。
+        var blanks = lqBlankAnswersFrom(q);
+        return {
+            type: q.type,
+            title: lqStripTags(q.title || q.plainTextTitle || ''),
+            ids: ids,
+            labels: labels,
+            letters: letters,
+            allLabels: allLabels,
+            blanks: blanks,
+            fillBlankType: q.fillBlankType,
+        };
+    }
+
+    // 答案获取：MOOC 走课件接口；SPOC 两份来源都试，按「和页面题块对得上几题」择优。
+    // 之前是「接口只要 ok 就收下」，但 SPOC 下这个接口经常能返回、返回的却是
+    // 整个单元的题或另一份试卷，于是界面表现成「答案和题目全对不上」，
+    // 真正对的 dwr paper 反而永远轮不到。
+    async function lqFetchQuestions(ctx, blocks) {
+        var apiRes = await lqFetchFromApi(ctx);
+        if (!isSpocCourse()) return apiRes;
+
+        var apiScore = (apiRes.ok && blocks && blocks.length) ? lqMatchScore(apiRes.questions, blocks) : -1;
+        if (apiRes.ok && blocks && blocks.length && apiScore >= blocks.length) {
+            logDebug('quiz', 'SPOC：课件接口 ' + apiScore + '/' + blocks.length + ' 题全对上，直接采用');
+            return apiRes;
+        }
+
+        logDebug('quiz', 'SPOC：改试 dwr paper（课件接口＝'
+            + (apiRes.ok ? '对上 ' + apiScore + '/' + blocks.length + ' 题' : '失败：' + apiRes.error) + '）');
+        var got = await spocEnsurePaper(12000);
+        if (got && SPOC_DWR.paper) {
+            var qs = spocParsePaper(SPOC_DWR.paper);
+            if (qs.length) {
+                var dwrScore = (blocks && blocks.length) ? lqMatchScore(qs, blocks) : qs.length;
+                logDebug('quiz', 'SPOC：dwr paper 解析到 ' + qs.length + ' 题，与页面对上 '
+                    + dwrScore + '/' + (blocks ? blocks.length : 0) + ' 题');
+                if (!apiRes.ok || dwrScore >= apiScore) return { ok: true, questions: qs, source: 'dwr' };
+            } else {
+                logDebug('quiz', 'SPOC：dwr paper 里没解析出 objectiveQList 题目');
+            }
+        }
+
+        if (apiRes.ok) return apiRes;
+        return {
+            ok: false,
+            error: 'SPOC 没拿到可用的试题数据：课件接口失败（' + apiRes.error
+                + '），dwr paper 也没捕获到。请手动切到别的「测试」再切回来，或刷新页面后重试',
+        };
+    }
+
+    async function lqFetchFromApi(ctx) {
+        if (!ctx || !ctx.courseKey || !ctx.lessonId) {
+            return { ok: false, error: '地址栏里解析不到 courseKey / lessonId' };
+        }
+        var qs = [
+            'courseKey=' + encodeURIComponent(ctx.courseKey),
+            'lessonId=' + encodeURIComponent(ctx.lessonId),
+            'entryMode=' + encodeURIComponent(ctx.entryMode || 'learn'),
+        ];
+        if (ctx.termId) qs.push('termId=' + encodeURIComponent(ctx.termId));
+        if (ctx.unitId) qs.push('unitId=' + encodeURIComponent(ctx.unitId));
+        var url = LESSON_QUIZ.API + '?' + qs.join('&');
+        logDebug('quiz', '请求答案接口：' + url);
+
+        var json = null;
+        try {
+            var res = await fetch(url, { credentials: 'include', headers: { 'Accept': 'application/json' } });
+            if (!res.ok) return { ok: false, error: '接口 HTTP ' + res.status };
+            json = await res.json();
+        } catch (e) {
+            return { ok: false, error: '接口请求失败：' + (e && e.message ? e.message : e) };
+        }
+
+        var quiz = json && json.result && json.result.quizData;
+        var list = quiz && (quiz.questions || quiz.questionList || quiz.questionVoList);
+        if (!list || !list.length) {
+            logDebug('quiz', '接口没给 quizData.questions；result 的键＝'
+                + (json && json.result ? Object.keys(json.result).join(',') : '（无 result）'));
+            return { ok: false, error: '接口里没有 quizData.questions（当前内容可能不是随堂测验）' };
+        }
+        var out = [];
+        for (var i = 0; i < list.length; i++) {
+            var q = lqParseApiQuestion(list[i]);
+            if (q) out.push(q);
+        }
+        if (out.length === 0) return { ok: false, error: '接口返回了题目但没解析出答案' };
+        return { ok: true, questions: out };
+    }
+
+    // 页面上这一题的题面 → 接口里的哪一题。优先精确相等，其次互相包含
+    // （页面多题号/分值、或者文本被截断都会导致两边长度不同）。
+    // 都失败时再用「选项集合重合度」反查——题干是图片、公式或者富文本时，
+    // 文字提取出来跟接口标题完全不像，但选项是一模一样的。
+    function lqMatchQuestion(questions, text, used, block) {
+        var key = lqKey(text);
+        var best = null, bestScore = 0;
+        if (key) {
+            for (var i = 0; i < questions.length; i++) {
+                var q = questions[i];
+                if (used.indexOf(q) !== -1) continue;
+                var k = lqKey(q.title);
+                if (!k) continue;
+                var score = 0;
+                if (k === key) score = 100000 + k.length;
+                else if (key.indexOf(k) !== -1) score = 50000 + k.length;
+                else if (k.indexOf(key) !== -1) score = 40000 + key.length;
+                else if (k.length >= 10 || key.length >= 10) {
+                    // 两边都有增删时用五字滑窗覆盖率兜底，命中率够高才认
+                    var ratio = lqCoverage(k, key);
+                    if (ratio >= 0.85) score = 10000 + Math.round(ratio * 100);
+                }
+                if (score > bestScore) { bestScore = score; best = q; }
+            }
+        }
+        if (best) return best;
+        return lqMatchByOptions(questions, block, used);
+    }
+
+    // 靠选项集合反查题目：只认「选项数 ≥3 且重合率 ≥0.8 且唯一最优」的情况。
+    // 判断题（只有两项、且各题选项都叫「正确/错误」）刻意不参与，避免张冠李戴。
+    function lqMatchByOptions(questions, block, used) {
+        if (!block) return null;
+        var pageOpts = [];
+        var rawOpts = lqOptions(block);
+        for (var a = 0; a < rawOpts.length; a++) {
+            var t = lqOptKey(rawOpts[a].text);
+            if (t) pageOpts.push(t);
+        }
+        if (pageOpts.length < 3) return null;
+
+        var best = null, bestHit = 0, tie = false;
+        for (var i = 0; i < questions.length; i++) {
+            var q = questions[i];
+            if (used.indexOf(q) !== -1) continue;
+            var apiOpts = q.allLabels || [];
+            if (apiOpts.length !== pageOpts.length) continue;
+            var hit = 0;
+            for (var j = 0; j < pageOpts.length; j++) {
+                for (var k = 0; k < apiOpts.length; k++) {
+                    var ak = lqOptKey(apiOpts[k]);
+                    if (!ak) continue;
+                    if (ak === pageOpts[j] || ak.indexOf(pageOpts[j]) !== -1 || pageOpts[j].indexOf(ak) !== -1) { hit++; break; }
+                }
+            }
+            var rate = hit / pageOpts.length;
+            if (rate < 0.8) continue;
+            if (hit > bestHit) { bestHit = hit; best = q; tie = false; }
+            else if (hit === bestHit) tie = true;
+        }
+        if (!best || tie) return null;
+        logDebug('quiz', '题干对不上，按选项集合反查命中 →「' + cleanText(best.title).slice(0, 24) + '」');
+        return best;
+    }
+
+    // 「答案题」和「页面题块」整体能对上多少题，用来在两份答案源之间择优
+    function lqMatchScore(questions, blocks) {
+        if (!questions || !questions.length || !blocks || !blocks.length) return 0;
+        var used = [], hit = 0;
+        for (var i = 0; i < blocks.length; i++) {
+            var q = lqMatchQuestion(questions, lqBlockText(blocks[i]), used, blocks[i]);
+            if (q) { used.push(q); hit++; }
+        }
+        return hit;
+    }
+
+    // 该题应该勾哪几个选项（返回选项下标）。三级策略，前一级没结果才走下一级：
+    //   ① 平台选项 ID 整段比对（最可靠，但页面往往不暴露 ID）；
+    //   ② 正确选项文案比对（剥掉「A、」前缀后做包含关系打分）；
+    //   ③ 字母/顺序兜底（接口只给 correctAnswer="A" 时，按可见顺序 + 选项自带字母定位）。
+    function lqCorrectIndexes(block, q) {
+        var opts = lqOptions(block);
+        var picked = [];
+        var i, j, k;
+
+        if (opts.length === 0) return picked;
+
+        if (q.ids && q.ids.length) {
+            for (i = 0; i < opts.length; i++) {
+                var tokens = lqIdTokens(opts[i].input);
+                for (j = 0; j < q.ids.length; j++) {
+                    if (tokens.indexOf(q.ids[j]) !== -1) { picked.push(i); break; }
+                }
+            }
+        }
+
+        if (picked.length === 0 && q.labels && q.labels.length) {
+            for (k = 0; k < q.labels.length; k++) {
+                var target = lqOptKey(q.labels[k]);
+                if (!target) continue;
+                var best = -1, bestScore = 0;
+                for (i = 0; i < opts.length; i++) {
+                    if (picked.indexOf(i) !== -1) continue;
+                    var t = lqOptKey(opts[i].text);
+                    if (!t) continue;
+                    var score = 0;
+                    if (t === target) score = 1000 + t.length;
+                    else if (t.indexOf(target) !== -1) score = 500 + target.length;
+                    else if (target.indexOf(t) !== -1 && t.length >= 2) score = 300 + t.length;
+                    // 长文案被截断（页面上「…」）时用覆盖率兜底
+                    else if (t.length >= 8 && target.length >= 8) {
+                        var ratio = lqCoverage(t, target);
+                        if (ratio >= 0.8) score = 100 + Math.round(ratio * 100);
+                    }
+                    if (score > bestScore) { bestScore = score; best = i; }
+                }
+                if (best !== -1) picked.push(best);
+            }
+        }
+
+        if (picked.length === 0 && q.letters && q.letters.length) {
+            for (k = 0; k < q.letters.length; k++) {
+                var want = String(q.letters[k]).toUpperCase();
+                var byLetter = -1;
+                for (i = 0; i < opts.length; i++) {
+                    if (picked.indexOf(i) !== -1) continue;
+                    if (lqOptionLeadLetter(opts[i].text) === want) { byLetter = i; break; }
+                }
+                var orderIdx = want.charCodeAt(0) - 65;
+                var byOrder = (orderIdx >= 0 && orderIdx < opts.length) ? orderIdx : -1;
+                // 选项自带字母与顺序对不上时以顺序为准（平台偶尔会把选项重排）
+                var hit = byOrder !== -1 ? byOrder : byLetter;
+                if (hit !== -1 && picked.indexOf(hit) === -1) picked.push(hit);
+            }
+        }
+
+        picked.sort(function (a, b) { return a - b; });
+        return picked;
+    }
+
+    // 短串的 5 字滑窗在长串里的覆盖率，用于截断文案的比对
+    function lqCoverage(shorter, longer) {
+        if (!shorter || !longer) return 0;
+        if (shorter.length > longer.length) { var tmp = shorter; shorter = longer; longer = tmp; }
+        var hit = 0, total = 0;
+        for (var s = 0; s + 5 <= shorter.length; s += 5) {
+            total++;
+            if (longer.indexOf(shorter.substr(s, 5)) !== -1) hit++;
+        }
+        return total ? hit / total : 0;
+    }
+
+    async function lqApplyAnswer(block, q) {
+        var i;
+
+        // —— 填空题 ——
+        // 判据以「页面结构」为准：这一块里有可填的输入框、且一个选项都没有，
+        // 那它就是填空题（接口 type 有时不标准，光看 type 会漏）。
+        var fields = lqBlankFields(block);
+        var optCount = lqOptions(block).length;
+
+        if (fields.length > 0 && optCount === 0) {
+            var blanks = q.blanks || [];
+            if (blanks.length === 0) {
+                return {
+                    ok: false,
+                    reason: '填空题：接口没给出答案（type=' + q.type + '，'
+                        + (isFillBlankQuestion(q) ? '识别为填空但没有答案字段' : '未识别为填空') + '）',
+                };
+            }
+            // 空数与答案数一致时逐空填；不一致就只填第一空，剩下的留给人补
+            var use = (fields.length === blanks.length) ? blanks : [blanks[0]];
+            var got = 0;
+            for (i = 0; i < fields.length && i < use.length; i++) {
+                lqSetBlank(fields[i], use[i]);
+                await sleep(150);
+                if (lqSameText(lqFieldValue(fields[i]), use[i])) got++;
+            }
+            var allOk = (got === fields.length && fields.length === use.length);
+            return {
+                ok: allOk,
+                reason: '填空 ' + got + '/' + fields.length + ' 空'
+                    + (allOk ? '' : '（答案 ' + blanks.length + ' 个 vs 空 ' + fields.length + ' 个）'),
+            };
+        }
+
+        var idxs = lqCorrectIndexes(block, q);
+        if (idxs.length === 0) {
+            // 区分「答案对不上选项」和「根本没找到选项元素」——两者修法完全不同
+            var probe = lqOptions(block);
+            return {
+                ok: false,
+                reason: probe.length === 0
+                    ? '没找到选项元素（不是 input/label 结构）'
+                    : '未匹配到选项（答案＝' + lqDescribeAnswer(q) + '；页面选项 ' + probe.length + ' 个）',
+            };
+        }
+
+        for (i = 0; i < idxs.length; i++) {
+            var opts = lqOptions(block);   // 每次重新查：点一下平台就会重渲染
+            var opt = opts[idxs[i]];
+            if (!opt) continue;
+            if (!opt.input.checked) {
+                try { opt.input.click(); } catch (e) { realClick(opt.input); }
+                if (!opt.input.checked) selectRadio(opt.input);
+                await sleep(CONFIG.DELAY_AFTER_CLICK);
+            }
+        }
+
+        var after = lqOptions(block);
+        var hit = 0;
+        for (i = 0; i < idxs.length; i++) {
+            if (after[idxs[i]] && after[idxs[i]].input.checked) hit++;
+        }
+        return { ok: hit === idxs.length, reason: '选项 ' + hit + '/' + idxs.length };
+    }
+
+    function lqFindSubmit(scope) {
+        // SPOC 的提交按钮是 .j-submit（不一定是 button，可能是 div/a）。
+        // 只在 SPOC 下走这条捷径，MOOC 仍用原来的按钮遍历，行为不变。
+        if (isSpocCourse()) {
+            var spocBtn = document.querySelector('.j-submit');
+            if (spocBtn && isVisible(spocBtn) && !spocBtn.disabled
+                && LESSON_QUIZ.SUBMIT_TEXT.test(cleanText(spocBtn.textContent || ''))) {
+                return spocBtn;
+            }
+        }
+        var roots = scope ? [scope, document] : [document];
+        for (var r = 0; r < roots.length; r++) {
+            var els = roots[r].querySelectorAll('button, [role="button"], input[type="submit"], a');
+            for (var i = 0; i < els.length; i++) {
+                var el = els[i];
+                if (!isVisible(el) || el.disabled) continue;
+                if (el.closest && el.closest('#mooc-auto-review-panel, #mar-probe-overlay, #mar-help-overlay, #mar-log-overlay, #mar-float-next')) continue;
+                var t = cleanText(el.textContent || el.value || '');
+                if (LESSON_QUIZ.SUBMIT_TEXT.test(t)) return el;
+            }
+        }
+        return null;
+    }
+
+    function lqFindReAnswer() {
+        var els = document.querySelectorAll('button, a, [role="button"], .j-replay');
+        for (var i = 0; i < els.length; i++) {
+            var el = els[i];
+            if (!isVisible(el) || el.disabled) continue;
+            if (LESSON_QUIZ.RE_ANSWER_TEXT.test(cleanText(el.textContent || ''))) return el;
+        }
+        return null;
+    }
+
+    // 提交后可能弹「确定要提交吗」。只点确定/确认类按钮，取消/关闭一律不碰。
+    function lqConfirmButton() {
+        var dlgs = collectCandidates(document, [
+            '[class*="dialog"]', '[class*="Dialog"]', '[class*="modal"]', '[class*="Modal"]',
+            '[class*="popup"]', '[class*="layer"]',
+        ], 30);
+        for (var d = 0; d < dlgs.length; d++) {
+            var dlg = dlgs[d];
+            if (!isVisible(dlg)) continue;
+            if (dlg.clientWidth < 160 || dlg.clientHeight < 80) continue;
+            if (dlg.closest && dlg.closest('#mooc-auto-review-panel, #mar-probe-overlay, #mar-help-overlay, #mar-log-overlay')) continue;
+            var btns = dlg.querySelectorAll('button, [role="button"], a, input[type="submit"]');
+            for (var b = 0; b < btns.length; b++) {
+                if (!isVisible(btns[b]) || btns[b].disabled) continue;
+                var t = cleanText(btns[b].textContent || btns[b].value || '');
+                if (/^(确定|确认|确认提交|确定提交|继续|是的|好的|提交)$/.test(t)) return btns[b];
+            }
+        }
+        return null;
+    }
+
+    // 提交后弹窗里的成绩文案（解析不出来就返回空，不影响流程）
+    function lqReadResult() {
+        var els = collectCandidates(document, [
+            '[class*="dialog"]', '[class*="Dialog"]', '[class*="modal"]', '[class*="Modal"]',
+            '[class*="result"]', '[class*="Result"]',
+        ], 20);
+        for (var i = 0; i < els.length; i++) {
+            var el = els[i];
+            if (!isVisible(el) || el.clientWidth < 160) continue;
+            if (el.closest && el.closest('#mooc-auto-review-panel, #mar-probe-overlay, #mar-help-overlay, #mar-log-overlay')) continue;
+            var t = cleanText(el.textContent || '');
+            if (!t || t.length > 300) continue;
+            if (/正确率|答对|答错|得分|本次得分|共\s*\d+\s*题/.test(t)) return t.slice(0, 120);
+        }
+        return '';
+    }
+
+    // 作答结果的统一描述，自动学习的状态栏和日志都用它
+    function lqResultText(r) {
+        switch (r && r.reason) {
+            case 'ok': return '已提交';
+            case 'exam': return '这是考试页，不作答';
+            case 'not-lesson-page': return '不是小节里的随堂测验';
+            case 'no-blocks': return '没找到题目';
+            case 'no-answer': return '读不到正确答案';
+            case 'no-answer-all': return '答案与题目全对不上';
+            case 'partial': return '有题目没匹配上';
+            case 'no-submit-btn': return '没找到提交按钮';
+            default: return (r && r.reason) || '未作答';
+        }
+    }
+
+    // 答案的可读摘要（日志用）：type / ids / letters / labels 都在一行里
+    function lqDescribeAnswer(q) {
+        if (!q) return '（空）';
+        var parts = ['type=' + (q.type === '' || q.type === undefined ? '?' : q.type)];
+        if (q.ids && q.ids.length) parts.push('ids[' + q.ids.join(',') + ']');
+        if (q.letters && q.letters.length) parts.push('letters[' + q.letters.join(',') + ']');
+        if (q.labels && q.labels.length) {
+            parts.push('labels[' + q.labels.map(function (s) { return cleanText(s).slice(0, 18); }).join(' | ') + ']');
+        }
+        if (q.blanks && q.blanks.length) parts.push('blanks[' + q.blanks.join(' | ').slice(0, 60) + ']');
+        return parts.join(' ');
+    }
+
+    // 匹配失败时的对照表：页面这一题长什么样、答案里那几题长什么样。
+    // 只在「没填满」时打一条，不刷屏；拿日志就能判断是题干对不上还是选项对不上。
+    function lqDumpMatch(questions, blocks) {
+        try {
+            var lines = [];
+            var maxB = Math.min(blocks.length, 12);
+            for (var i = 0; i < maxB; i++) {
+                var opts = lqOptions(blocks[i]);
+                var names = [];
+                for (var o = 0; o < opts.length; o++) names.push(cleanText(opts[o].text).slice(0, 14) || '(空)');
+                var blanks = lqBlankFields(blocks[i]).length;
+                lines.push('页面' + (i + 1) + '「' + lqBlockText(blocks[i]).slice(0, 34) + '」选项×' + opts.length
+                    + (blanks ? ' 填空框×' + blanks : '')
+                    + '[' + names.join(' / ') + ']');
+            }
+            var maxQ = Math.min(questions.length, 12);
+            for (var j = 0; j < maxQ; j++) {
+                lines.push('答案' + (j + 1) + '「' + cleanText(questions[j].title).slice(0, 34) + '」'
+                    + lqDescribeAnswer(questions[j]));
+            }
+            logDebug('quiz', '对照诊断（页面 ' + blocks.length + ' 题 / 答案 ' + questions.length + ' 题）：'
+                + lines.join(' ⏎ '));
+        } catch (e) { /* 诊断失败不影响主流程 */ }
+    }
+
+    async function completeLessonQuiz() {
+        if (PAGE_CONFIG.examUrl.test(location.href)) {
+            updateStatus('⚠️ 这是考试页，本功能不处理（考试通常只有一次机会，请手动作答）');
+            return { ok: false, submitted: false, reason: 'exam' };
+        }
+        // MOOC 的单元测验/作业是独立路由，也没有随堂测验的容器。
+        // 光凭「页面上有题」就作答等于替人交测验，这里直接拦住。
+        if (!isSpocCourse() && PAGE_CONFIG.quizUrl.test(location.href) && !lqScope()) {
+            updateStatus('⚠️ 这更像单元测验/作业页（不是小节里的随堂测验），本功能不动手，避免消耗答题机会');
+            return { ok: false, submitted: false, reason: 'not-lesson-page' };
+        }
+        // SPOC 下只在「小节内容页的测试标签」动手。单元测验/作业是独立页，
+        // 没有内容条和内容标签栏——在那种页面上作答等于替人考试，直接拒绝。
+        if (isSpocCourse() && !spocInLessonPage()) {
+            updateStatus('⚠️ SPOC：这不像小节内容页（可能是单元测验/作业/考试），本功能只处理随堂测验');
+            return { ok: false, submitted: false, reason: 'not-lesson-page' };
+        }
+
+        var scope = lqScope();
+        var blocks = lqBlocks(scope);
+        if (blocks.length === 0) {
+            updateStatus('⚠️ 没检测到随堂测验题目：请先进入小节里的「测试」标签再点我');
+            return { ok: false, submitted: false, reason: 'no-blocks' };
+        }
+        logDebug('quiz', '检测到随堂测验：容器' + (scope ? '命中' : '未命中（整页兜底）') + '，题块 ' + blocks.length + ' 个');
+
+        // 之前提交过、现在停在结果页：先点「重新答题」回到作答态
+        var re = lqFindReAnswer();
+        if (re) {
+            updateStatus('↻ 检测到已答过，先点「重新答题」...');
+            realClick(re);
+            await sleep(1500);
+            scope = lqScope();
+            blocks = lqBlocks(scope);
+            if (blocks.length === 0) {
+                updateStatus('❌ 重新答题后没找到题目区块，已停止（未提交）');
+                return { ok: false, submitted: false, reason: 'no-blocks' };
+            }
+        }
+
+        updateStatus('🔎 正在从课件接口读取本次随堂测验的答案...');
+        var res = await lqFetchQuestions(lqContext(), blocks);
+        if (!res.ok) {
+            updateStatus('❌ 读不到正确答案：' + res.error + '（一个选项都没点，也没提交）');
+            return { ok: false, submitted: false, reason: 'no-answer' };
+        }
+        logDebug('quiz', '答案源「' + (res.source || 'api') + '」返回 ' + res.questions.length
+            + ' 道题，页面题块 ' + blocks.length + ' 个');
+
+        var used = [], filled = 0, missing = [];
+        for (var i = 0; i < blocks.length; i++) {
+            if (taskState.cancelled) throw makeCancelError();
+            var block = blocks[i];
+            var text = lqBlockText(block);
+            var q = lqMatchQuestion(res.questions, text, used, block);
+            if (!q) {
+                missing.push(text.slice(0, 24) || ('第 ' + (i + 1) + ' 题'));
+                logDebug('quiz', '第 ' + (i + 1) + ' 题没匹配上答案：' + text.slice(0, 40));
+                continue;
+            }
+            used.push(q);
+            var r = await lqApplyAnswer(block, q);
+            if (r.ok) filled++;
+            else {
+                missing.push(text.slice(0, 24) || ('第 ' + (i + 1) + ' 题'));
+                logDebug('quiz', '第 ' + (i + 1) + ' 题作答不完整：' + r.reason
+                    + '（答案=' + lqDescribeAnswer(q) + '）');
+            }
+            updateStatus('📝 作答中 ' + (i + 1) + '/' + blocks.length + ' 题（已填 ' + filled + '）...');
+            await sleep(250);
+        }
+
+        // 没全填上就吐一份「页面题块 vs 答案」的对照，方便回传排查
+        if (filled < blocks.length) lqDumpMatch(res.questions, blocks);
+
+        if (filled === 0) {
+            updateStatus('❌ 一题都没能作答（答案和页面题目对不上），已停止，未提交；日志里有对照明细');
+            return { ok: false, submitted: false, reason: 'no-answer-all' };
+        }
+        // 少答一题就提交等于交白卷。宁可留几道让人补，也不替他赌。
+        if (missing.length > 0 || res.questions.length > blocks.length) {
+            var why = missing.length > 0
+                ? ('有 ' + missing.length + ' 题没匹配上答案（' + missing.join(' / ') + '）')
+                : ('接口有 ' + res.questions.length + ' 题、页面只渲染了 ' + blocks.length + ' 题，可能分页显示');
+            // 题数对不上时，把「没被任何题块匹配到的答案」列出来——是填空题没认出来、
+            // 还是真分页，看这一行就能分清
+            if (res.questions.length > blocks.length) {
+                var left = [];
+                for (var k = 0; k < res.questions.length; k++) {
+                    if (used.indexOf(res.questions[k]) === -1) left.push(cleanText(res.questions[k].title).slice(0, 22));
+                }
+                if (left.length) logDebug('quiz', '没被页面接住的答案：' + left.join(' / '));
+            }
+            updateStatus('⚠️ 已填 ' + filled + ' 题，但' + why + '；请手动补完再点提交（为免交白卷，未自动提交）');
+            return { ok: true, submitted: false, reason: 'partial', filled: filled, missing: missing.length };
+        }
+
+        var submit = lqFindSubmit(scope);
+        if (!submit) {
+            updateStatus('⚠️ ' + filled + ' 题已全部作答，但没找到「提交」按钮，请手动提交');
+            return { ok: true, submitted: false, reason: 'no-submit-btn', filled: filled };
+        }
+        updateStatus('🚀 ' + filled + ' 题已全部作答，正在提交...');
+        realClick(submit);
+        await sleep(1200);
+        for (var c = 0; c < 3; c++) {
+            var okBtn = lqConfirmButton();
+            if (!okBtn) break;
+            logDebug('quiz', '提交确认弹窗，点击「' + cleanText(okBtn.textContent) + '」');
+            realClick(okBtn);
+            await sleep(1500);
+        }
+        await sleep(800);
+        var result = lqReadResult();
+        if (result) logDebug('quiz', '提交结果：' + result);
+        updateStatus('✅ 随堂测验已提交（' + filled + ' 题）' + (result ? '：' + result : ''));
+        return { ok: true, submitted: true, reason: 'ok', filled: filled, result: result || '' };
+    }
+
+    // 当前页面是不是「小节里的随堂测验」——只有它允许自动作答。
+    // 判据（从严到宽）：
+    //   ① 考试页一律不是；
+    //   ② 命中随堂测验容器（LessonQuizUnit 等）→ 是，最可靠；
+    //   ③ URL 明确是单元测验/作业，又没看到随堂测验容器 → 不是；
+    //   ④ 必须落在学习内容页（/content/{id} 或老 hash 路由）且有可见题块。
+    // 单元测验、作业、考试都是独立页面，靠 ③④ 挡掉。
+    function isLessonQuizPage() {
+        if (PAGE_CONFIG.examUrl.test(location.href)) return false;
+        // ① 最高优先级：真的有随堂测验容器 + 题块，就是随堂测验。
+        // 这里必须和「随堂测验：一键完成并提交」用同一套判据（lqScope + lqBlocks），
+        // 否则会出现「手动点按钮能作答、自动学习却判成非随堂测验而跳过」。
+        var scope = lqScope();
+        if (scope && lqBlocks(scope).length > 0) return true;
+        // ② SPOC：小节内容页里的题块
+        if (isSpocCourse()) return spocInLessonPage() && hasVisibleQuestionBlocks();
+        // ③ MOOC：独立路由的单元测验/作业一律不碰
+        if (PAGE_CONFIG.quizUrl.test(location.href)) return false;
+        if (!inLessonContentPage()) return false;
+        return hasVisibleQuestionBlocks();
+    }
+
+    // 自动学习走到测验内容时，页面可能刚切过来、题块还没渲染。
+    // 此时立刻判会得出「非随堂测验」而直接跳过，所以要给一段等待窗口。
+    async function waitLessonQuizReady(timeout) {
+        var t0 = Date.now();
+        while (Date.now() - t0 < timeout) {
+            if (taskState.cancelled) return false;
+            if (isLessonQuizPage()) {
+                logDebug('quiz', '随堂测验就绪（' + (Date.now() - t0) + 'ms）');
+                return true;
+            }
+            await sleep(500);
+        }
+        logDebug('quiz', '等了 ' + timeout + 'ms 仍未识别到随堂测验容器/题块');
+        return isLessonQuizPage();
+    }
+
+    // 内容白页时催一次重载：把当前标签再点一下，等对应元素出现。
+    // 平台偶尔会「标签切了、内容区没回填」（请求失败或 SPA 状态没刷新），
+    // 重发一次通常就好了；比默默按「加载失败」跳到下一个内容强。
+    async function nudgeCurrentContent(kind) {
+        var tab = currentContentTab();
+        if (!tab) return false;
+        logDebug('load', '内容没渲染出来，重新点击当前标签催一次（类型=' + kind + '）');
+        updateStatus('🔄 内容没渲染出来，正在重新加载...');
+        realClick(tab);
+        await sleep(600);
+        realClick(tab);
+        var t0 = Date.now();
+        while (Date.now() - t0 < 8000) {
+            if (taskState.cancelled) return false;
+            if (kind === 'video' && findVideo()) return true;
+            if (kind === 'doc' && findDocViewer()) return true;
+            if (kind === 'discussion' && looksLikeDiscussionPage()) return true;
+            await sleep(400);
+        }
+        logDebug('load', '催了一次仍然没渲染出来（类型=' + kind + '）');
+        return false;
+    }
+
+    // 题块迟迟不出现时的自救：干等是最没用的策略（日志里那 15s + 8s 就是这么白等的）。
+    // 三种情况各有一条路，按代价从小到大试：
+    //   ① 页面停在「已提交/查看解析」的结果态 → 点「重做/重新答题」回到作答态；
+    //   ② SPA 点了标签但内容区没回填（XHR 丢包、状态没刷新）→ 把当前标签再点一次；
+    //   ③ 标签已是选中态、再点被平台忽略 → 切到隔壁标签再切回来，逼它真发一次请求。
+    // 全部失败才返回 false，由上层按「单元测验/作业」跳过，并打一份现场摘要。
+    async function retryQuizRender(rounds) {
+        var tab = currentContentTab();
+        if (!tab) { logDebug('quiz', '自救失败：找不到当前内容标签'); return false; }
+        // 标签文字先记下来：后面点「重做/开始答题」可能让标签栏重渲染，旧节点会失效
+        var tabText = cleanText(tab.textContent || '');
+
+        // 课件本身坏了（unitId/lessonId 不匹配）就没什么可救的，别白等几十秒
+        var bodyHead = cleanText(document.body ? document.body.textContent : '').slice(0, 3000);
+        if (/课件不存在|课件加载失败|内容不存在|资源不存在|unitId[\s\S]{0,20}不匹配|lessonId[\s\S]{0,20}不匹配/.test(bodyHead)) {
+            logDebug('quiz', '自救放弃：页面提示课件不存在/加载失败，重试没有意义');
+            return false;
+        }
+
+        // ① 结果态：有「重做」按钮就直接回到作答态
+        var replay = lqFindReAnswer();
+        if (replay) {
+            logDebug('quiz', '自救①：页面停在结果态（有「' + cleanText(replay.textContent).slice(0, 8) + '」），先点它回到作答态');
+            updateStatus('🔄 检测到已作答的测验，先点「重新答题」...');
+            realClick(replay);
+            if (await waitLessonQuizReady(8000)) return true;
+        }
+
+        // ④ 还没开始作答的测验：内容标签里给了「开始答题」这类入口，点进去再等题块。
+        //    只在小节内容标签里这么干（tab 类型=quiz 才会走到这里），且地址不在单元测验路由上；
+        //    按钮文字走白名单，「查看解析/查看答案」这类一律不碰。
+        if (!PAGE_CONFIG.quizUrl.test(location.href)) {
+            var entry = quizEntryButton();
+            if (entry) {
+                var entryText = cleanText(entry.textContent || '').slice(0, 8);
+                logDebug('quiz', '自救④：检测到测验入口「' + entryText + '」，点进去再等题块');
+                updateStatus('🔄 点开测验入口「' + entryText + '」...');
+                realClick(entry);
+                if (await waitLessonQuizReady(8000)) return true;
+            }
+        }
+
+        var prevTab = null;
+        var tabs = contentTabs();
+        var myIdx = tabs.indexOf(tab);
+        if (myIdx > 0) prevTab = tabs[myIdx - 1];
+
+        for (var r = 0; r < rounds; r++) {
+            if (taskState.cancelled) return false;
+
+            // ② 重新点当前标签
+            logDebug('quiz', '自救②：重新点击当前内容标签（第 ' + (r + 1) + ' 次）');
+            updateStatus('🔄 测验内容没渲染出来，重新加载当前内容（第 ' + (r + 1) + ' 次）...');
+            tab = findContentTabByText(tabText) || currentContentTab() || tab;
+            realClick(tab);
+            await sleep(700);
+            realClick(tab);
+            if (await waitLessonQuizReady(6000)) {
+                logDebug('quiz', '自救②成功：重渲染后题块已出现');
+                return true;
+            }
+
+            // ③ 切到隔壁再切回来（只做一次，代价最大）
+            if (r === 0 && prevTab) {
+                logDebug('quiz', '自救③：切到相邻内容再切回来，逼平台重新请求本课件');
+                updateStatus('🔄 切走再切回，强制平台重新加载测验...');
+                var prevText = cleanText(prevTab.textContent || '');
+                var p = findContentTabByText(prevText) || prevTab;
+                realClick(p);
+                await sleep(1500);
+                var back = findContentTabByText(tabText);
+                if (back) {
+                    realClick(back);
+                    if (await waitLessonQuizReady(8000)) {
+                        logDebug('quiz', '自救③成功：切回后题块已出现');
+                        return true;
+                    }
+                }
+            }
+        }
+
+        logDebug('quiz', '自救全部失败。现场摘要：' + quizGiveUpDigest());
+        return false;
+    }
+
+    // 「还没开始作答」的测验入口按钮。只认开始/继续类文字，
+    // 「查看解析 / 查看答案 / 查看成绩」是结果态，点进去也答不了题，所以不碰。
+    function quizEntryButton() {
+        var els = document.querySelectorAll('button, a, [role="button"]');
+        for (var i = 0; i < els.length; i++) {
+            var el = els[i];
+            if (!isVisible(el) || el.disabled) continue;
+            if (el.closest && el.closest('#mooc-auto-review-panel, #mar-probe-overlay, #mar-help-overlay, #mar-log-overlay, #mar-float-next')) continue;
+            var t = cleanText(el.textContent || el.value || '');
+            if (!t || t.length > 12) continue;
+            if (/^(开始答题|继续答题|开始测验|立即答题|进入测验|开始作答|继续作答)$/.test(t)) return el;
+        }
+        return null;
+    }
+
+    // 按标签文字找内容标签（重渲染后旧节点会失效，不能继续用它）
+    function findContentTabByText(text) {
+        var t = cleanText(text).slice(0, 30);
+        if (!t) return null;
+        var tabs = contentTabs();
+        for (var i = 0; i < tabs.length; i++) {
+            if (cleanText(tabs[i].textContent || '').slice(0, 30) === t) return tabs[i];
+        }
+        return null;
+    }
+
+    // 放弃作答时把现场说清楚：是没有题、还是只有个入口按钮、还是压根没加载。
+    // 免得下次又是「跳过」两个字，谁也判断不了该修哪儿。
+    function quizGiveUpDigest() {
+        var bits = [];
+        var kind = contentKindFromTab(currentContentTab());
+        bits.push('标签类型=' + (kind || '?'));
+
+        var radios = document.querySelectorAll('input[type="radio"], input[type="checkbox"]');
+        var visRadio = 0;
+        for (var i = 0; i < radios.length; i++) {
+            if (isVisible(radios[i]) || isVisible(radios[i].parentElement)) visRadio++;
+        }
+        bits.push('可见单选框=' + visRadio);
+        bits.push('可见填空框=' + (function () {
+            var n = 0;
+            var fs = lqBlankFields(document);
+            for (var k = 0; k < fs.length; k++) if (isVisible(fs[k])) n++;
+            return n;
+        })());
+        bits.push('题块类名命中=' + (hasVisibleQuestionBlocks() ? '是' : '否'));
+
+        // 页面上有没有「开始答题 / 继续答题 / 查看测验」这类入口按钮
+        var btns = document.querySelectorAll('button, a, [role="button"]');
+        var entries = [];
+        for (var b = 0; b < btns.length && entries.length < 4; b++) {
+            var t = cleanText(btns[b].textContent || '').slice(0, 10);
+            if (!t) continue;
+            if (!/开始答题|继续答题|开始测验|进入测验|查看测验|查看解析|立即答题/.test(t)) continue;
+            entries.push(t);
+        }
+        if (entries.length) bits.push('入口按钮[' + entries.join(' / ') + ']');
+
+        var body = cleanText(document.body ? document.body.textContent : '').slice(0, 4000);
+        if (/课件不存在|加载失败|内容不存在/.test(body)) bits.push('页面提示课件不存在/加载失败');
+        else if (/已提交|本次得分|查看答案|正确答案/.test(body)) bits.push('页面是结果/解析态');
+        return bits.join('，');
+    }
+
+    // 是否停在某个课件内容页——随堂测验一定嵌在这里面。
+    // 关键：不能只看 URL。icourse163 的老版 hash 路由把单元测验、作业、已交卷的
+    // 答案解析都挂在 #/learn/content 下，只看地址会把单元测验当成随堂测验。
+    // 所以主判据是「有内容标签栏」（随堂测验本身就是内容条里的一个 tab），
+    // 独立页面的单元测验/作业没有这根条。
+    function inLessonContentPage() {
+        var tabs = [];
+        try { tabs = contentTabs() || []; } catch (e) { /* ignore */ }
+        if (tabs.length > 0) return true;
+        if (document.querySelector('.unitslist, .learn-unit-tabs-scroll')) return true;
+        // 路径兜底：新版内容页，且 URL 不是单元测验/作业路由
+        if (!PAGE_CONFIG.quizUrl.test(location.href) && /\/content\/\d+/.test(location.pathname)) return true;
+        return false;
+    }
+
+    // ===================== 自动学习（新版学习页） =====================
+    // 同时支持新版学习页两种形态：
+    //   旧版 hash 路由：#/learn/content?type=detail&id=xxx
+    //   新版路径路由：/mooc/learn/{课程}/content/{内容ID}?tid=...&chapterId=...
+    // 整章自动学习：
+    //   视频：从头播放；看完后按目录进入下一个内容（测验/文档/讨论等），
+    //         而不是跳到下一个视频；
+    //   文档：自动翻页，每页停留 1 秒（含新版 mooc-docs-reader 缩略图阅读器）；
+    //   讨论：自动回复（复用课堂讨论逻辑）；
+    //   视频中弹出的题目：自动作答（正确与否不保证）——
+    //         答对平台放行、视频自动继续；答错则等待用户手动点击播放后继续；
+    //   随堂测验：自动作答并提交，提交后停留 10 秒再进下一个内容；
+    //   单元测验/作业/考试：独立页面，一律不作答，只短暂停留后跳过。
+    // 目录解析失败时退化为按 id±1 相邻导航，并用章节标题判断边界。
+    // 新版路径路由跳转 = 整页刷新，靠 localStorage 续跑状态跨页续跑。
+
+    // 页面里是否有“可见”的题目块（随堂测验/单元测验/考试页通用）
+    function hasVisibleQuestionBlocks() {
+        var els = document.querySelectorAll(
+            '.u-questionItem, .m-choiceQuestion, .m-subjectiveQuestion, .m-fillblankQuestion, .j-questionItem, ' +
+            '[class*="questionItem"], [class*="question-item"], [class*="choiceQuestion"], [class*="fillblankQuestion"], ' +
+            '[class*="fillblank"], [class*="judgeQuestion"], [class*="objectiveQuestion"], [class*="testItem"]'
+        );
+        for (var i = 0; i < els.length; i++) {
+            if (isVisible(els[i])) return true;
+        }
+        // 类名兜不住的版式：当前内容标签明确说是测验，页面里又真有可见的单选/多选框，
+        // 那按题块算。否则会出现「标签=quiz、题块类名不认识」→ 等满 15 秒 → 被当成
+        // 单元测验跳过。加标签类型这个门槛，是为了不在视频弹题浮层、讨论区上误判。
+        if (contentKindFromTab(currentContentTab()) === 'quiz' &&
+            (hasVisibleChoiceInputs() || hasVisibleFillFields())) return true;
+        return false;
+    }
+
+    // 页面上是否存在可见的「可填写输入框」（填空题）。只在「标签=测验」时参与判定，
+    // 否则讨论区的回复框会让任何页面都像测验页。
+    function hasVisibleFillFields() {
+        var els = document.querySelectorAll('input, textarea, [contenteditable="true"]');
+        for (var i = 0; i < els.length; i++) {
+            var el = els[i];
+            if (el.closest && el.closest('#mooc-auto-review-panel, #mar-probe-overlay, #mar-help-overlay, #mar-log-overlay, #mar-float-next')) continue;
+            if (lqIsFillable(el)) return true;
+        }
+        return false;
+    }
+
+    // 页面上是否存在「可见的」单选/多选框（opacity:0 盖假图标的也算）
+    function hasVisibleChoiceInputs() {
+        var inputs = document.querySelectorAll('input[type="radio"], input[type="checkbox"]');
+        var n = 0;
+        for (var i = 0; i < inputs.length; i++) {
+            var inp = inputs[i];
+            if (inp.closest && inp.closest('#mooc-auto-review-panel, #mar-probe-overlay, #mar-help-overlay, #mar-log-overlay')) continue;
+            if (!isVisible(inp) && !isVisible(inp.parentElement)) continue;
+            n++;
+            if (n >= 2) return true;
+        }
+        return false;
+    }
+
+    // 从地址栏解析当前内容 ID：
+    //   新版路径路由：/mooc/learn/{课程}/content/{内容ID}?tid=...（Hash 为空）
+    //   旧版 hash 路由：#/learn/content?type=detail&id=123
+    function learnCurrentContentId() {
+        var m = location.pathname.match(/\/content\/(\d+)/);
+        if (m) return parseInt(m[1], 10);
+        m = location.hash.match(/id=(\d+)/);
+        return m ? parseInt(m[1], 10) : null;
+    }
+
+    // 当前课程路径前缀，例如 /mooc/learn/HPU-1474216172
+    // 用来过滤页面里其他课程/广告链接，保证只收集本课程的内容链接
+    function learnCoursePrefix() {
+        var m = location.pathname.match(/^(\/mooc\/learn\/[^/]+)/);
+        return m ? m[1] : null;
+    }
+
+    // 收集章节目录里的内容链接（含 data-id 的节点），按页面顺序返回 [{id, el, href}]
+    // 优先严格模式：只收能归属到某个“章”的链接（chapterTitleOfLink 非空），
+    // 避免页面上的课程卡片/广告链接污染本章内容列表。
+    // 若严格模式一个都收不到（新版侧栏可能没有可解析的章标题节点），
+    // 退回宽松模式：收本课程路径下所有 /content/ 链接。
+    function learnContentLinks() {
+        var strict = collectCatalogLinks(true);
+        if (strict.length > 0) return strict;
+        var loose = collectCatalogLinks(false);
+        return loose;
+    }
+
+    function collectCatalogLinks(requireChapter) {
+        var out = [], seen = {};
+        var coursePrefix = learnCoursePrefix();
+        var sels = [
+            '[class*="catalog"] a, [class*="chapter"] a, [class*="menu"] a, [class*="lesson"] a, [class*="section"] a, [class*="unit"] a, [class*="node"] a, [class*="learnItem"] a, [class*="learn-item"] a',
+            '[class*="catalog"] [data-id], [class*="chapter"] [data-id], [class*="menu"] [data-id], [class*="lesson"] [data-id], [class*="section"] [data-id], [class*="node"] [data-id]',
+            '[class*="catalog"] [data-content-id], [class*="chapter"] [data-content-id], [class*="lesson"] [data-content-id]',
+            // 新版 UI（mooc- 前缀侧栏）
+            '[class*="mooc-catalog"] a, [class*="mooc-lesson"] a, [class*="mooc-chapter"] a, [class*="mooc-sidebar"] a, [class*="mooc-menu"] a, [class*="mooc-nav"] a',
+            '[class*="mooc-catalog"] [data-content-id], [class*="mooc-lesson"] [data-content-id]',
+            // 新版 UI（learn- 前缀侧栏，如 learn-navigation-link）
+            '[class*="learn-navigation"] a, [class*="learn-nav"] a, [class*="learn-catalog"] a, [class*="learn-lesson"] a, [class*="learn-chapter"] a, [class*="learn-section"] a, [class*="learn-unit"] a, [class*="learn-list"] a, [class*="learn-menu"] a',
+            '[class*="learn-navigation"] [data-content-id], [class*="learn-list"] [data-content-id], [class*="learn-lesson"] [data-content-id]',
+            // 旧版 hash 路由
+            'a[href*="#/learn/content"]',
+            'a[href*="#/learn/forum"]',
+        ];
+        if (!requireChapter) {
+            // 宽松模式：本课程路径下所有指向 /content/ 的链接，以及 learn-navigation 锚点
+            sels.push('a[href*="/content/"]');
+            sels.push('a[class*="learn-navigation"], a[class*="learn-nav"], a[href*="/mooc/learn/"]');
+        }
+        for (var s = 0; s < sels.length; s++) {
+            var els;
+            try { els = document.querySelectorAll(sels[s]); } catch (e) { continue; }
+            for (var i = 0; i < els.length; i++) {
+                var srcEl = els[i];
+                var a = (srcEl.tagName === 'A') ? srcEl : srcEl.querySelector('a[href*="id="], a[href*="/content/"]');
+                // 跳过“上一个/下一个/返回”这类导航按钮
+                if (a && /上一个|下一个|上一节|下一节|上一讲|下一讲|上一章|下一章|返回|首页/.test(cleanText((a.textContent || '').slice(0, 6)))) continue;
+                if (a && coursePrefix) {
+                    var ah = a.getAttribute('href') || '';
+                    // 宽松模式下只收本课程的链接；目录容器里的链接不强制（容器本身已限定范围）
+                    if (!requireChapter && ah.indexOf(coursePrefix) !== 0 && ah.indexOf('#') !== 0) continue;
+                }
+                var id = linkIdOf(a || srcEl);
+                if (id === null || seen[id]) continue;
+                // 严格模式必须能归属到章；宽松模式不要求
+                if (requireChapter && !chapterTitleOfLink(a || srcEl)) continue;
+                seen[id] = true;
+                out.push({ id: id, el: a || srcEl, href: a ? (a.getAttribute('href') || '') : '' });
+            }
+        }
+        return out;
+    }
+
+    // 从链接（或带 data 属性的节点）里解析内容 ID，兼容新旧两种 URL 形态
+    function linkIdOf(node) {
+        if (!node) return null;
+        var href = (node.getAttribute && node.getAttribute('href')) || '';
+        var m = href.match(/\/content\/(\d+)/) || href.match(/id=(\d+)/);
+        if (m) return parseInt(m[1], 10);
+        var di = (node.getAttribute && (node.getAttribute('data-content-id') || node.getAttribute('data-id'))) || '';
+        if (di && /^\d+$/.test(di)) return parseInt(di, 10);
+        return null;
+    }
+
+    // 形如「1 总论」「第1章 xxx」「第一章」「第一单元」的才是章标题。
+    // 注意排除节标题（1-1 xxx）和测验条目（单元测验/随堂测验）。
+    function looksLikeChapterHeading(t) {
+        if (!t || t.length < 2 || t.length > 30) return false;
+        if (/章|讲|篇|专题|Module|Chapter|Part/i.test(t)) return true;
+        if (/周/.test(t) && /第\s*[一二三四五六七八九十\d]+\s*周/.test(t)) return true;
+        if (/单元(?!测验|测试|作业|检测|练习)/.test(t)) return true;
+        if (/^\d{1,2}\s*[^\d.、．\-－]/.test(t)) return true; // “1 总论”“2 会计科目”
+        return false;
+    }
+
+    // 某个内容链接所属“章”的标题（从它的祖先链上找章标题节点）
+    function chapterTitleOfLink(link) {
+        var node = link && link.parentElement;
+        var depth = 0;
+        while (node && depth < 10) {
+            var heads = node.querySelectorAll(
+                ':scope > h2, :scope > h3, :scope > h4, :scope > h5, :scope > h6, ' +
+                ':scope > [class*="chapter"], :scope > [class*="catalog-title"], :scope > [class*="catalogTitle"], ' +
+                ':scope > [class*="unit-title"], :scope > [class*="unitTitle"]'
+            );
+            for (var i = 0; i < heads.length; i++) {
+                var t = cleanText(heads[i].textContent);
+                if (looksLikeChapterHeading(t)) return t;
+            }
+            node = node.parentElement;
+            depth++;
+        }
+        return null;
+    }
+
+    // 当前页面的章节标题（标题栏/面包屑 → 目录兜底）
+    function learnChapterTitleText() {
+        var cands = [
+            '.titleBar', '[class*="titleBar"]', '[class*="crumb"]', '[class*="breadcrumb"]',
+            '[class*="chapterTitle"]', '[class*="chapter-title"]', '[class*="learnTitle"]',
+            '[class*="content-title"]', '.m-crumb',
+            // 新版 UI（learn- 前缀）
+            '[class*="learn-title"]', '[class*="learn-chapter"]', '[class*="learn-catalog"]',
+            '[class*="learn-lesson-title"]', '[class*="learn-header-title"]', '[class*="learn-unit"]',
+            '[class*="learn-section-title"]', '[class*="learn-content-title"]',
+        ];
+        for (var c = 0; c < cands.length; c++) {
+            var els;
+            try { els = document.querySelectorAll(cands[c]); } catch (e) { continue; }
+            for (var i = 0; i < els.length; i++) {
+                var t = cleanText(els[i].textContent);
+                if (!t || t.length > 80) continue;
+                var segs = t.split(/[>›»·|—–/]/);
+                for (var k = 0; k < segs.length; k++) {
+                    var seg = cleanText(segs[k]);
+                    if (looksLikeChapterHeading(seg)) return seg;
+                }
+                // 宽松兜底：取第一段
+                var first = cleanText(segs[0]);
+                if (first && first.length >= 2 && first.length <= 30 && !/^\d+$/.test(first)) return first;
+            }
+        }
+        var heads = document.querySelectorAll('[class*="catalog"] h3, [class*="catalog"] h4, [class*="chapter"] h3, [class*="chapter"] h4, [class*="catalog"] [class*="chapter"], [class*="catalog"] [class*="catalog-title"], [class*="catalog"] [class*="catalogTitle"], [class*="learn-navigation"] h3, [class*="learn-navigation"] h4, [class*="learn-list"] [class*="title"], [class*="learn-nav"] [class*="title"]');
+        for (i = 0; i < heads.length; i++) {
+            var t2 = cleanText(heads[i].textContent);
+            if (looksLikeChapterHeading(t2)) return t2;
+        }
+        return null;
+    }
+
+    // 可见的 video 元素
+    function findVideo() {
+        var v = document.querySelector('video');
+        return v && isVisible(v) ? v : null;
+    }
+
+    // 播放器上的“播放/开始”按钮（autoplay 被拦时兜底用真实点击）
+    function findPlayButtons() {
+        var out = [], els = document.querySelectorAll('button, a, [role="button"], span, div');
+        for (var i = 0; i < els.length; i++) {
+            var el = els[i];
+            if (!isVisible(el)) continue;
+            var cls = String(el.className || '');
+            var label = el.getAttribute ? (el.getAttribute('aria-label') || el.getAttribute('title') || '') : '';
+            if (!/\b(play|start)\b/i.test(cls) && !/play|start/i.test(label) && !/播放|开始/.test(cleanText((el.textContent || '').slice(0, 12)))) continue;
+            if (el.clientWidth > 400 || el.clientHeight > 400) continue;
+            out.push(el);
+        }
+        return out;
+    }
+
+    async function playVideo(video) {
+        if (!video) return;
+        applyVideoRate(video);
+        var p = null;
+        try { p = video.play(); } catch (e) { p = null; }
+        if (p && p.catch) p.catch(function () {});
+        // 等 play() 生效：视频仍在暂停就继续等一小段
+        var t0 = Date.now();
+        while (Date.now() - t0 < 2500 && video.paused) { await sleep(200); }
+        if (!video.paused) return;
+        // autoplay 被拦时兜底：真实点击播放器上的播放/开始按钮
+        var btns = findPlayButtons();
+        var clicked = false;
+        for (var i = 0; i < btns.length; i++) { realClick(btns[i]); clicked = true; }
+        if (clicked) await sleep(700);
+    }
+
+    // —— 视频倍速（设置页可调，0.5x ~ 3x，落盘 localStorage）——
+    function loadVideoRate() {
+        try {
+            var r = parseFloat(localStorage.getItem('mar.video.rate'));
+            if (r >= 0.5 && r <= 3) return r;
+        } catch (e) {}
+        return 1;
+    }
+    function saveVideoRate(r) {
+        try { localStorage.setItem('mar.video.rate', String(r)); } catch (e) {}
+    }
+    // 把倍速应用到视频上（部分播放器切清晰度/拖动进度后会重置倍速，需要持续应用）
+    function applyVideoRate(video) {
+        var r = loadVideoRate();
+        try { if (video && Math.abs(video.playbackRate - r) > 0.01) video.playbackRate = r; } catch (e) {}
+    }
+
+    // ===================== 视频弹题拦截 =====================
+    // 弹题本质是两件事：把视频暂停 + 盖一层浮层。两件事分别掐掉，视频就能一路播下去。
+    //
+    // 为什么必须掐 pause：浮层删了平台还会再插一次，而暂停只发生在“打点”那一下。
+    // 那一次没真的停下来，后面就不会再有暂停——除非有人拖进度条。
+    //
+    // 为什么还要收浮层：pause 被吞掉、视频继续播，但浮层会一直盖在画面上。
+    // 自动学习时人不在，挡着无所谓；可它上面往往还有个透明遮罩劫持鼠标事件，
+    // 后面脚本要点的按钮就点不动了，所以还是收掉干净。
+    var POPUP_GUARD = {
+        installed: false,
+        active: false,
+        prevPause: null,
+        observer: null,
+        blocked: 0,          // 掐掉的暂停次数
+        hidden: 0,           // 收掉的浮层次数
+        resumed: 0,          // 主动恢复播放次数
+        popupSeenAt: 0,      // 最近一次看到弹题浮层的时间
+        lastSweepAt: 0,
+    };
+
+    var POPUP_SWEEP_SELECTOR = [
+        '[class*="dialog"]', '[class*="modal"]', '[class*="popup"]', '[class*="Popup"]',
+        '[class*="layer"]', '[class*="overlay"]', '[class*="mask"]', '[class*="Mask"]',
+        '[class*="question"]', '[class*="quiz"]', '[class*="Quiz"]',
+    ].join(',');
+
+    // 单个节点是不是「盖在视频上的题」。判据比 findQuizPopup 宽松一点：
+    // 我们是在做全页扫描，宁可多认几个也要抓住刚插进来还没渲染完的浮层。
+    function isQuizOverlay(el) {
+        if (!el || el.nodeType !== 1) return false;
+        if (el.__marHidden) return false;
+        if (!isVisible(el)) return false;
+        if (el.clientWidth < 200 || el.clientHeight < 100) return false;
+        if (el.closest && el.closest('#mooc-auto-review-panel, #mar-probe-overlay, #mar-help-overlay, #mar-log-overlay, #mar-next-btn')) return false;
+        // 目录/侧栏也常带 dialog 类名，排除掉，别把导航面板收没了
+        if (el.closest && el.closest('[class*="catalog"], [class*="sidebar"], [class*="menu"], [class*="nav"]')) return false;
+
+        // 包着播放器的节点绝不能动：收掉它等于把播放器一起收掉
+        var v = findVideo();
+        if (v && el.contains(v)) return false;
+
+        // 用 innerText 而不是 textContent 来判选项形态：innerText 保留视觉换行，
+        // 而 cleanText 会把换行压成空格，「A. xxx」就不再是行首，判不出来。
+        var raw = '';
+        try { raw = el.innerText || el.textContent || ''; } catch (e) { raw = el.textContent || ''; }
+        var txt = cleanText(raw);
+        if (!txt || txt.length > 2000) return false;
+
+        // 两类特征认一个就行：有题干用语，或者有「A. / 1、/ ①」这种选项形态。
+        // 只认前一种会漏掉文案很短的弹题（比如「随堂小练」）。
+        var hasPrompt = /请选择|请回答|请作答|单选题|多选题|判断题|填空题|本题|正确选项|以下哪|下列哪|选一选|作答/.test(txt);
+        var hasOptionShape = /(?:^|[\n\r])\s*[A-Ha-h1-9]\s*[\.、．）)]\s*\S/.test(raw)
+            // 版式全在一行时（「A. int B. while」）靠两个连续选项认，这时得用压平后的文本
+            || /[A-Ha-h]\s*[\.、．）)]\s*[^\s].{0,40}?[A-Ha-h]\s*[\.、．）)]\s*[^\s]/.test(txt);
+        if (!hasPrompt && !hasOptionShape) return false;
+
+        // 得真有能选/能点的东西，否则就是块说明文字。
+        // 注意 hasOptionShape 也当作“有选项”的证据：有的弹层整块是 div，
+        // 既没有 input 也没有 button，只能靠文字形态认。
+        var pickable = el.querySelector('input[type="radio"], input[type="checkbox"], [role="radio"], [role="checkbox"], [class*="option"], [class*="choice"], [class*="selectItem"]');
+        var clickable = el.querySelector('button, [role="button"], input[type="button"], input[type="submit"]');
+        if (!pickable && !clickable && !hasOptionShape) return false;
+        return true;
+    }
+
+    // 收掉浮层：display:none 而不是 remove。remove 会让平台的状态机找不到自己
+    // 插进去的节点，有些实现会因此反复重插、甚至把播放器一起重建（画面闪黑）。
+    function hideQuizOverlay(el) {
+        if (!isQuizOverlay(el)) return false;
+        try {
+            el.style.setProperty('display', 'none', 'important');
+            el.__marHidden = true;
+        } catch (e) { return false; }
+
+        // 顺手收掉同级的遮罩兄弟：弹层走了遮罩还在，整页都会点不动
+        var parent = el.parentElement;
+        if (parent) {
+            for (var i = 0; i < parent.children.length; i++) {
+                var sib = parent.children[i];
+                if (sib === el || sib.__marHidden || !isVisible(sib)) continue;
+                if (!/mask|overlay|backdrop|shadow|modal/i.test(String(sib.className || ''))) continue;
+                try {
+                    sib.style.setProperty('display', 'none', 'important');
+                    sib.__marHidden = true;
+                } catch (e2) { /* 单个兄弟失败不影响主流程 */ }
+            }
+        }
+        POPUP_GUARD.hidden++;
+        POPUP_GUARD.popupSeenAt = Date.now();
+        return true;
+    }
+
+    function sweepQuizOverlays() {
+        if (!POPUP_GUARD.active) return 0;
+        var now = Date.now();
+        if (now - POPUP_GUARD.lastSweepAt < 120) return 0;  // 插入高峰时限流，别把主线程占满
+        POPUP_GUARD.lastSweepAt = now;
+
+        var els, n = 0;
+        try { els = document.querySelectorAll(POPUP_SWEEP_SELECTOR); } catch (e) { return 0; }
+        for (var i = 0; i < els.length && n < 6; i++) {
+            if (hideQuizOverlay(els[i])) n++;
+        }
+        return n;
+    }
+
+    var popupSweepTimer = null;
+    function scheduleSweep() {
+        if (popupSweepTimer) return;
+        popupSweepTimer = setTimeout(function () {
+            popupSweepTimer = null;
+            sweepQuizOverlays();
+        }, 100);
+    }
+
+    // 视频被停住了就拉起来。「自动播放策略」只拦“没有用户手势的 play()”，
+    // 而我们是在一个已经有播放历史的 video 上调用，通常能过；过不了也没关系，
+    // 循环里还有一层兜底（和手工点一下播放是同一条路径）。
+    function resumeAfterGuard() {
+        var v = findVideo();
+        if (!v || !v.paused) return false;
+        try {
+            var p = v.play();
+            if (p && p.catch) p.catch(function () {});
+            POPUP_GUARD.resumed++;
+            return true;
+        } catch (e) { return false; }
+    }
+
+    function installPopupGuard() {
+        if (POPUP_GUARD.installed) return;
+        if (typeof HTMLMediaElement === 'undefined' || !HTMLMediaElement.prototype.pause) return;
+
+        POPUP_GUARD.prevPause = HTMLMediaElement.prototype.pause;
+        POPUP_GUARD.installed = true;
+
+        // 不暂停，但要给「不是弹题的暂停」留一条回去的路：
+        // 有些暂停是平台正常逻辑（切清晰度、切集）或用户手点的。
+        // 所以这里先压住 1.2 秒——这期间冒出弹题浮层，就判定是弹题、保持播放；
+        // 没冒出来，说明是别的暂停，补一次真正的 pause，行为跟没拦截时一致。
+        HTMLMediaElement.prototype.pause = function () {
+            if (!POPUP_GUARD.active) {
+                return POPUP_GUARD.prevPause.apply(this, arguments);
+            }
+            if (this.paused) return;   // 已经是暂停态，原生也不会做任何事
+
+            var media = this;
+            var prevPause = POPUP_GUARD.prevPause;
+            POPUP_GUARD.blocked++;
+
+            setTimeout(function () {
+                try {
+                    if (!POPUP_GUARD.active) { prevPause.call(media); return; }
+                    // 1.2 秒内见过浮层 → 认定这次暂停是弹题干的，作废
+                    if (Date.now() - POPUP_GUARD.popupSeenAt < 2500) return;
+                    if (media.paused) return;
+                    prevPause.call(media);
+                } catch (e) { /* 播放器可能已经被 SPA 换掉了，忽略 */ }
+            }, 1200);
+            return undefined;
+        };
+    }
+
+    function startPopupGuard() {
+        if (!isPopupSkipOn()) {
+            logDebug('quiz', '弹题拦截已关闭，走自动作答并提交');
+            return;
+        }
+        installPopupGuard();
+        POPUP_GUARD.active = true;
+        POPUP_GUARD.popupSeenAt = 0;
+        if (!POPUP_GUARD.observer && window.MutationObserver) {
+            POPUP_GUARD.observer = new MutationObserver(function (records) {
+                if (!POPUP_GUARD.active) return;
+                for (var i = 0; i < records.length; i++) {
+                    var added = records[i].addedNodes;
+                    for (var j = 0; j < added.length; j++) {
+                        var node = added[j];
+                        if (!node || node.nodeType !== 1) continue;
+                        // 只对「看起来像浮层」的新节点做扫描，避免整页变动都触发
+                        if (!/dialog|modal|popup|layer|overlay|mask|question|quiz/i.test(String(node.className || ''))) continue;
+                        scheduleSweep();
+                        return;
+                    }
+                }
+            });
+            try { POPUP_GUARD.observer.observe(document.body, { childList: true, subtree: true }); }
+            catch (e) { POPUP_GUARD.observer = null; }
+        }
+        logDebug('quiz', '弹题拦截已开启：暂停会被压住，浮层出现即收掉');
+        // 进视频时可能已经有残留浮层，先扫一遍
+        scheduleSweep();
+    }
+
+    function stopPopupGuard() {
+        POPUP_GUARD.active = false;
+        if (POPUP_GUARD.observer) {
+            try { POPUP_GUARD.observer.disconnect(); } catch (e) {}
+            POPUP_GUARD.observer = null;
+        }
+        if (popupSweepTimer) { clearTimeout(popupSweepTimer); popupSweepTimer = null; }
+    }
+
+    // 视频中弹出的题目浮层。只在有视频时探测；强特征（题干文字）出现时
+    // 即使视频还在播也认，避免漏掉“先弹题后暂停”的情况。
+    function findQuizPopup() {
+        var video = findVideo();
+        if (!video) return null;
+        var sels = [
+            '[class*="dialog"]', '[class*="modal"]', '[class*="popup"]', '[class*="layer"]', '[class*="overlay"]',
+            '[class*="question"]', '[class*="quiz"]', '[class*="Quiz"]', '[class*="testQuestion"]',
+            '[class*="interaction"]', '[class*="ask"]', '[class*="topic"]',
+        ];
+        for (var s = 0; s < sels.length; s++) {
+            var els;
+            try { els = document.querySelectorAll(sels[s]); } catch (e) { continue; }
+            for (var i = 0; i < els.length; i++) {
+                var el = els[i];
+                if (!isVisible(el)) continue;
+                if (el.clientWidth < 220 || el.clientHeight < 120) continue;
+                if (el.closest && el.closest('[class*="catalog"], [class*="sidebar"], [class*="menu"]')) continue;
+                var txt = cleanText(el.textContent).slice(0, 400);
+                if (!txt) continue;
+                var strong = /请选择|请回答|请作答|单选题|多选题|判断题|填空题/.test(txt);
+                var markers = strong || /本题|选项|[A-H]\s*[\.、．）)]/.test(txt);
+                if (!markers) continue;
+                if (!video.paused && !strong) continue;
+                var hasOpt = false, hasSub = false, o, b;
+                var opts = el.querySelectorAll('input[type="radio"], input[type="checkbox"], label, [class*="option"], [class*="choice"], [class*="answer"]');
+                for (o = 0; o < opts.length; o++) { if (isVisible(opts[o])) { hasOpt = true; break; } }
+                var subs = el.querySelectorAll('button, input[type="button"], input[type="submit"], [role="button"]');
+                for (b = 0; b < subs.length; b++) { if (isVisible(subs[b])) { hasSub = true; break; } }
+                if (!hasOpt && !hasSub) continue;
+                return el;
+            }
+        }
+        return null;
+    }
+
+    // —— 视频弹题取答案 ——
+    // 视频弹题的题目跟着课件接口一起下发，但字段名各版本不一样
+    // （videoQuiz / popupQuiz / questionPointList / interactiveQuestion …）。
+    // 所以不去猜字段名，而是递归扫整个 JSON：凡是长得像「一道带选项和正确答案的题」
+    // 就收下来。字段名会改，结构不太会改。
+    var VIDEO_QUIZ_CACHE = { key: '', at: 0, questions: null };
+    var VIDEO_DIG_BUDGET = 20000;
+
+    function looksLikeQuestion(o) {
+        if (!o || typeof o !== 'object' || Array.isArray(o)) return false;
+        var opts = o.options || o.optionList || o.optionVoList || o.choices;
+        if (!opts || typeof opts.length !== 'number' || !opts.length) return false;
+        var first = opts[0];
+        if (!first || typeof first !== 'object') return false;
+        if (!(first.label || first.content || first.text || first.optionContent)) return false;
+        if (o.correctOptionIds || o.correctOptionId || o.answerIds || o.correctAnswer) return true;
+        for (var i = 0; i < opts.length; i++) {
+            var p = opts[i];
+            if (p && (p.answer === true || p.isAnswer === true || p.correct === true)) return true;
+        }
+        return false;
+    }
+
+    function digQuizQuestions(node, out, depth) {
+        // 课件接口的 JSON 很大（课件、评论、题目全混在一起），递归必须设预算，
+        // 否则一个深分支就能把主线程卡住好几秒
+        if (!node || depth > 6 || out.length >= 40 || VIDEO_DIG_BUDGET <= 0) return;
+        VIDEO_DIG_BUDGET--;
+        if (Array.isArray(node)) {
+            for (var i = 0; i < node.length && i < 60; i++) digQuizQuestions(node[i], out, depth + 1);
+            return;
+        }
+        if (typeof node !== 'object') return;
+        if (looksLikeQuestion(node)) {
+            // 归一化成 lqParseApiQuestion 认识的形状，各版本的字段名在这里对齐一次
+            var q = lqParseApiQuestion({
+                type: node.type,
+                title: node.title || node.plainTextTitle || node.questionTitle || node.content || '',
+                options: node.options || node.optionList || node.optionVoList || node.choices || [],
+                correctOptionIds: node.correctOptionIds || node.correctOptionId || node.answerIds || [],
+                correctAnswer: node.correctAnswer,
+            });
+            if (q && q.title) out.push(q);
+        }
+        for (var k in node) {
+            if (!Object.prototype.hasOwnProperty.call(node, k)) continue;
+            var v = node[k];
+            if (v && typeof v === 'object') digQuizQuestions(v, out, depth + 1);
+        }
+    }
+
+    async function fetchUnitPageJson(ctx) {
+        if (!ctx || !ctx.courseKey || !ctx.lessonId) return null;
+        var qs = [
+            'courseKey=' + encodeURIComponent(ctx.courseKey),
+            'lessonId=' + encodeURIComponent(ctx.lessonId),
+            'entryMode=' + encodeURIComponent(ctx.entryMode || 'learn'),
+        ];
+        if (ctx.termId) qs.push('termId=' + encodeURIComponent(ctx.termId));
+        if (ctx.unitId) qs.push('unitId=' + encodeURIComponent(ctx.unitId));
+        var url = LESSON_QUIZ.API + '?' + qs.join('&');
+        try {
+            var res = await fetch(url, { credentials: 'include', headers: { 'Accept': 'application/json' } });
+            if (!res.ok) { logDebug('quiz', '视频弹题取答案：接口 HTTP ' + res.status); return null; }
+            return await res.json();
+        } catch (e) {
+            logDebug('quiz', '视频弹题取答案失败：' + (e && e.message ? e.message : e));
+            return null;
+        }
+    }
+
+    // 缓存 60 秒：一个视频里可能弹好几道，每次都打一次接口既慢又没必要
+    async function videoQuizAnswers() {
+        var ctx = lqContext();
+        var key = [ctx.courseKey, ctx.lessonId, ctx.unitId, ctx.termId].join('|');
+        if (VIDEO_QUIZ_CACHE.key === key && Date.now() - VIDEO_QUIZ_CACHE.at < 60000) {
+            return VIDEO_QUIZ_CACHE.questions || [];
+        }
+        var json = await fetchUnitPageJson(ctx);
+        var raw = [];
+        VIDEO_DIG_BUDGET = 20000;
+        if (json) digQuizQuestions(json, raw, 0);
+        if (VIDEO_DIG_BUDGET <= 0) {
+            logDebug('quiz', '视频弹题：接口 JSON 过大，扫描提前结束（已找到 ' + raw.length + ' 道）');
+        }
+
+        var seen = {}, uniq = [];
+        for (var i = 0; i < raw.length; i++) {
+            var k = lqKey(raw[i].title);
+            if (!k || seen[k]) continue;
+            seen[k] = true;
+            uniq.push(raw[i]);
+        }
+        VIDEO_QUIZ_CACHE = { key: key, at: Date.now(), questions: uniq };
+        logDebug('quiz', '视频弹题：课件接口里挖到 ' + uniq.length + ' 道带答案的题');
+        return uniq;
+    }
+
+    // 弹层里的选项。版式不确定，三层兜底：label+input → 裸 input → 像选项的文字块
+    function popupOptions(popup) {
+        var out = lqOptions(popup);
+        if (out.length) return out;
+
+        var i, el;
+        var inputs = popup.querySelectorAll('input[type="radio"], input[type="checkbox"]');
+        for (i = 0; i < inputs.length; i++) {
+            if (!isVisible(inputs[i]) || inputs[i].disabled) continue;
+            el = (inputs[i].closest && inputs[i].closest('label')) || inputs[i].parentElement;
+            out.push({ el: el, input: inputs[i], text: lqOptionText(el) });
+        }
+        if (out.length) return out;
+
+        var cands = popup.querySelectorAll('[class*="option"], [class*="choice"], [class*="selectItem"], li, [role="radio"], [role="checkbox"]');
+        for (i = 0; i < cands.length; i++) {
+            el = cands[i];
+            if (!isVisible(el)) continue;
+            var t = cleanText(el.textContent || '');
+            if (!t || t.length > 120) continue;
+            // 只认「A. xxx」「1、xxx」「① xxx」这种选项形态，免得把题干当选项点了
+            if (!/^[A-Ha-h1-9]\s*[\.、．）)]|^[①②③④⑤⑥⑦⑧]/.test(t)) continue;
+            out.push({ el: el, input: null, text: t });
+        }
+        return out;
+    }
+
+    // 该勾哪几个选项（返回下标）。先按平台 ID 整段比对，认不出再用文案匹配——
+    // 和随堂测验那边同一套判据，理由也同一个：ID 会被加前缀、会互为后缀。
+    function popupCorrectIndexes(options, q) {
+        var picked = [], i, j;
+        if (q.ids && q.ids.length) {
+            for (i = 0; i < options.length; i++) {
+                var tokens = lqIdTokens(options[i].input);
+                if (!tokens.length && options[i].el && options[i].el.id) tokens = [String(options[i].el.id)];
+                for (j = 0; j < q.ids.length; j++) {
+                    if (tokens.indexOf(q.ids[j]) !== -1) { picked.push(i); break; }
+                }
+            }
+        }
+        if (picked.length === 0 && q.labels && q.labels.length) {
+            for (var k = 0; k < q.labels.length; k++) {
+                var target = lqKey(q.labels[k]);
+                if (!target) continue;
+                var best = -1, bestScore = 0;
+                for (i = 0; i < options.length; i++) {
+                    if (picked.indexOf(i) !== -1) continue;
+                    var t = lqKey(options[i].text);
+                    if (!t) continue;
+                    var score = 0;
+                    if (t === target) score = 1000 + t.length;
+                    else if (t.indexOf(target) !== -1) score = 500 + target.length;
+                    else if (target.indexOf(t) !== -1 && t.length >= 2) score = 300 + t.length;
+                    if (score > bestScore) { bestScore = score; best = i; }
+                }
+                if (best !== -1) picked.push(best);
+            }
+        }
+        return picked;
+    }
+
+    // 作答弹题。顺序：接口答案 → 匹配不上才顺位猜（只为让平台放行）。
+    // 返回 true 表示已点过提交。
+    async function answerQuizPopup(popup) {
+        var i;
+        var options = popupOptions(popup);
+        var popupText = cleanText(popup.textContent || '').slice(0, 600);
+        var picked = [];
+        var usedRealAnswer = false;
+
+        if (CONFIG.LEARN_VIDEO_ANSWER_POPUP && options.length) {
+            var qs = await videoQuizAnswers();
+            if (qs && qs.length) {
+                var q = lqMatchQuestion(qs, popupText, []);
+                if (q) {
+                    picked = popupCorrectIndexes(options, q);
+                    usedRealAnswer = picked.length > 0;
+                    logDebug('quiz', '弹题匹配到接口题目「' + String(q.title || '').slice(0, 30)
+                        + '」，应选 ' + picked.length + ' 个选项');
+                } else {
+                    logDebug('quiz', '弹题没在接口的 ' + qs.length + ' 道题里匹配上，改用顺位作答');
+                }
+            }
+        }
+
+        var clickedOpt = false;
+        if (usedRealAnswer) {
+            for (i = 0; i < picked.length; i++) {
+                var opt = options[picked[i]];
+                if (!opt) continue;
+                realClick(opt.input || opt.el);
+                clickedOpt = true;
+            }
+            updateStatus('📝 视频弹题：按接口答案作答（' + picked.length + ' 项）');
+        }
+
+        if (!clickedOpt) {
+            var radios = popup.querySelectorAll('input[type="radio"], input[type="checkbox"]');
+            for (i = 0; i < radios.length; i++) {
+                if (isVisible(radios[i]) && !radios[i].disabled) { realClick(radios[i]); clickedOpt = true; break; }
+            }
+        }
+        if (!clickedOpt) {
+            var opts = popup.querySelectorAll('label, li, [class*="option"], [class*="choice"], [class*="answer"], [class*="selectItem"]');
+            for (i = 0; i < opts.length; i++) {
+                var el = opts[i];
+                if (!isVisible(el)) continue;
+                var t = cleanText(el.textContent);
+                if (!t || t.length > 120) continue;
+                if (/^(确定|提交|完成|继续|关闭|下一题|保存|我知道了|重试)$/.test(t)) continue;
+                realClick(el); clickedOpt = true; break;
+            }
+        }
+        if (!clickedOpt) updateStatus('⚠️ 题目弹窗里没找到选项，先尝试直接提交');
+        await sleep(500);
+        var btns = popup.querySelectorAll('button, input[type="button"], input[type="submit"], a[role="button"], div[role="button"], span[role="button"]');
+        var SUBMIT = /^(提交|确定|完成|继续|下一题|保存|提交答案|确认|知道了)$/;
+        for (i = 0; i < btns.length; i++) {
+            var el2 = btns[i];
+            if (!isVisible(el2) || el2.disabled) continue;
+            var tt = cleanText(el2.textContent || el2.value || '').slice(0, 6);
+            if (SUBMIT.test(tt)) { realClick(el2); return true; }
+        }
+        return clickedOpt;
+    }
+
+    async function waitForVideo() {
+        var t0 = Date.now();
+        while (Date.now() - t0 < 20000) {
+            if (taskState.cancelled) throw makeCancelError();
+            var v = findVideo();
+            if (v) return v;
+            await sleep(500);
+        }
+        return null;
+    }
+
+    // 视频内容：从头播放 → 处理弹题 → 看完返回 true
+    // 弹题优先拦截（不收暂停、收浮层），拦不住才退一步自动作答提交。
+    async function learnVideoItem() {
+        var video = await waitForVideo();
+        if (!video) { logDebug('video', '⚠️ 未检测到播放器，按其它内容处理'); updateStatus('⚠️ 未检测到播放器，按其它内容处理'); return true; }
+        // 监听 ended 事件：视频一播完立刻触发跳转（比轮询更快更可靠）
+        if (!video.__marEndedHook) {
+            video.__marEndedHook = true;
+            video.addEventListener('ended', function () {
+                try { video.__marEndedFlag = true; } catch (e) {}
+            });
+        }
+
+        // 拦截要赶在播放之前装好：平台可能在开播瞬间就把打点排上了
+        startPopupGuard();
+        try {
+            try { if (video.currentTime > 0) video.currentTime = 0; } catch (e) {}
+            logDebug('video', '从头播放：时长=' + (video.duration ? video.duration.toFixed(1) : '?') + 's，倍速=' + loadVideoRate() + 'x');
+            updateStatus('▶ 从头播放视频，看完自动进入下一个内容...');
+            await playVideo(video);
+
+            var manualResume = false;
+            var lastAnswerAt = 0;
+            var lastRetry = 0;
+            var guardFailAt = 0;
+            var answerTries = 0;
+
+            while (!taskState.cancelled) {
+                video = findVideo() || video;
+                applyVideoRate(video); // 持续应用倍速（切清晰度/拖动进度后平台可能重置）
+
+                // 0) 用户点了【下一节】→ 跳过当前视频
+                if (manualWaitFlag) { logDebug('video', '用户点击【下一节】，跳过当前视频'); updateStatus('⏭ 用户点击【下一节】，跳过当前视频'); return true; }
+
+                // 1) 弹题拦截：主动扫一遍，比等 MutationObserver 更及时
+                if (POPUP_GUARD.active) {
+                    var swept = sweepQuizOverlays();
+                    if (swept > 0) {
+                        resumeAfterGuard();
+                        guardFailAt = 0;
+                        logDebug('quiz', '已收掉 ' + swept + ' 个弹题浮层（累计 ' + POPUP_GUARD.hidden + ' 次），视频继续播放');
+                        updateStatus('⏭ 已拦截视频弹题，继续播放...');
+                        await sleep(CONFIG.LEARN_IDLE_POLL);
+                        continue;
+                    }
+                }
+
+                var popup = findQuizPopup();
+                if (popup) POPUP_GUARD.popupSeenAt = Date.now();
+
+                // 2) 还有浮层 → 拦不掉就转兜底作答
+                if (popup && POPUP_GUARD.active) {
+                    if (!guardFailAt) guardFailAt = Date.now();
+                    if (Date.now() - guardFailAt < CONFIG.LEARN_VIDEO_GUARD_GRACE) {
+                        // 给浮层一点时间自己消失（有些弹层是淡出动画，节点还在但已经在收）
+                        await sleep(CONFIG.LEARN_IDLE_POLL);
+                        continue;
+                    }
+                    logDebug('quiz', '弹题浮层收不掉（多半它包着播放器），转自动作答');
+                    updateStatus('📝 弹题拦不住，改为自动作答...');
+                }
+
+                if (popup && CONFIG.LEARN_VIDEO_ANSWER_POPUP && Date.now() - lastAnswerAt > 2500) {
+                    lastAnswerAt = Date.now();
+                    guardFailAt = 0;
+                    answerTries++;
+
+                    // 连答 5 次浮层还在：说明这个弹层根本点不动（判据认错了节点，
+                    // 或者它是平台强制的、答完也不给关）。别在这儿死循环，跳过这个视频。
+                    if (answerTries > 5) {
+                        logDebug('quiz', '⚠️ 弹题连续作答 ' + answerTries + ' 次仍未消失，跳过当前视频避免卡死');
+                        updateStatus('⚠️ 弹题反复出现，已跳过当前视频');
+                        return true;
+                    }
+
+                    updateStatus('📝 视频中弹出题目，自动作答...');
+                    logDebug('quiz', '视频中弹出题目，自动作答（第 ' + answerTries + ' 次）...');
+                    await answerQuizPopup(popup);
+
+                    // 拦截还开着：视频大概率压根没停，收掉浮层继续就行，
+                    // 不用等“平台放行”——那个判断在暂停被压住时永远为假。
+                    if (POPUP_GUARD.active) {
+                        await sleep(1200);
+                        hideQuizOverlay(popup);
+                        resumeAfterGuard();
+                        logDebug('quiz', '兜底作答完成，视频继续播放');
+                        updateStatus('✅ 弹题已作答，继续播放');
+                        continue;
+                    }
+
+                    var t0 = Date.now(), resumed = false;
+                    while (Date.now() - t0 < CONFIG.LEARN_QUIZ_RESUME_WAIT) {
+                        await sleep(CONFIG.LEARN_IDLE_POLL);
+                        var vv = findVideo();
+                        if (vv && !vv.paused && vv.currentTime > 0) { resumed = true; break; }
+                    }
+                    if (resumed) {
+                        logDebug('quiz', '✅ 答对，平台放行，视频自动继续');
+                        updateStatus('✅ 题目已答，平台放行，视频自动继续播放');
+                    } else {
+                        logDebug('quiz', '⚠️ 可能答错，视频停止 —— 请手动点播放，脚本持续监控');
+                        updateStatus('⚠️ 答案可能不对，视频已停止 —— 请手动点击播放按钮继续，脚本会继续监控');
+                        manualResume = true;
+                        var v = findVideo();
+                        if (v) {
+                            await new Promise(function (resolve) {
+                                var doneFlag = false;
+                                function fin() { if (doneFlag) return; doneFlag = true; clearInterval(poller); resolve(); }
+                                function check() {
+                                    if (taskState.cancelled || manualWaitFlag) { fin(); return; }
+                                    var c = findVideo();
+                                    if (c && !c.paused) fin();
+                                }
+                                var poller = setInterval(check, 600);
+                                setTimeout(fin, 10 * 60 * 1000);
+                                if (v.addEventListener) v.addEventListener('play', fin, { once: true });
+                            });
+                        }
+                        manualResume = false;
+                        logDebug('video', '已检测到手动播放，继续监控');
+                        updateStatus('▶ 已检测到手动播放，继续监控视频...');
+                    }
+                    continue;
+                }
+
+                // 3) 看完 → 进入下一个内容（ended 事件触发或时长到边）
+                if (video.__marEndedFlag || video.ended || (video.duration > 0 && video.currentTime >= video.duration - CONFIG.LEARN_VIDEO_END_MARGIN)) {
+                    logDebug('video', '🎬 播放完毕（currentTime=' + (video.currentTime || 0).toFixed(1) + '/duration=' + (video.duration || 0).toFixed(1) + '）');
+                    updateStatus('🎬 视频播放完毕');
+                    // 记下这个节点：后面的内容若还没换掉 DOM，不能用它判断“已看完”
+                    learnLastVideoEl = video;
+                    return true;
+                }
+
+                // 4) 意外暂停（非弹题、非手动等待）→ 尝试恢复
+                if (video.paused && !manualResume && Date.now() - lastAnswerAt > 2500 && Date.now() - lastRetry > 2500) {
+                    lastRetry = Date.now();
+                    await playVideo(video);
+                }
+                await sleep(CONFIG.LEARN_IDLE_POLL);
+            }
+        } finally {
+            // 无论怎么退出（看完/跳过/取消/异常）都要把拦截撤掉，
+            // 否则会一直压着页面上的暂停，用户手动点暂停也没反应
+            stopPopupGuard();
+        }
+        return false;
+    }
+
+    // 文档查看器（新版课件/PDF/PPT；含新版 mooc-docs-reader 阅读器）
+    function findDocViewer() {
+        var sels = [
+            '[class*="mooc-docs-reader"]', '[class*="docs-reader"]', '[class*="mooc-doc"]',
+            '[class*="doc-viewer"]', '[class*="docViewer"]', '[class*="document-viewer"]',
+            '[class*="pptViewer"]', '[class*="ppt-viewer"]', '[class*="pdfViewer"]', '[class*="pdf-viewer"]',
+            '[class*="slideViewer"]', '[class*="slide-viewer"]', '[class*="coursewareViewer"]',
+            '[class*="course-doc"]', '[class*="courseDoc"]', '[class*="docContent"]', '[class*="doc-content"]',
+            '[class*="docPage"]', '[class*="doc-page"]', '[class*="slidePage"]', '[class*="slide-page"]',
+            '[class*="attachmentPage"]', '[class*="attachment-page"]',
+            // SPOC 课件
+            '.m-doc', '[class*="m-doc"]', '[class*="courseware"]', '[class*="pptPlayer"]',
+        ];
+        for (var s = 0; s < sels.length; s++) {
+            var els;
+            try { els = document.querySelectorAll(sels[s]); } catch (e) { continue; }
+            for (var i = 0; i < els.length; i++) {
+                var el = els[i];
+                if (!isVisible(el)) continue;
+                if (el.clientHeight < 120 || el.clientWidth < 200) continue;
+                if (el.closest && el.closest('[class*="catalog"], [class*="sidebar"], [class*="menu"], [class*="nav"]')) continue;
+                return el;
+            }
+        }
+        // 兜底：主内容区里一张可见的大图（文档页常为整页图片）
+        var imgs = document.querySelectorAll('img');
+        for (i = 0; i < imgs.length; i++) {
+            var im = imgs[i];
+            if (!isVisible(im)) continue;
+            if (im.clientWidth < 200 || im.clientHeight < 150) continue;
+            if (im.closest && im.closest('[class*="catalog"], [class*="avatar"], [class*="header"], [class*="footer"], [class*="qr"]')) continue;
+            return im.closest('div, section') || im;
+        }
+        return null;
+    }
+
+    // 文档的“下一页”按钮（含新版阅读器：点当前激活页缩略图的后一张）
+    function findDocNextBtn() {
+        var scope = findDocViewer() || document;
+        // 新版 mooc-docs-reader：缩略图按钮 1..N，is-active 是当前页
+        var thumbs = scope.querySelectorAll('.mooc-docs-reader__thumbnail, [class*="mooc-docs-reader__thumbnail"]');
+        if (thumbs.length > 0) {
+            for (var t = 0; t < thumbs.length - 1; t++) {
+                if (thumbs[t].classList.contains('is-active')) return thumbs[t + 1];
+            }
+            return null; // 已在最后一页
+        }
+        var els = scope.querySelectorAll(
+            'button, a, span, [role="button"], input[type="button"], input[type="submit"], ' +
+            '[class*="next"], [class*="Next"], [class*="turn"], [class*="arrow"], [class*="Arrow"]'
+        );
+        var NEXT_TEXT = /^(下一页|下一张|后一页|下一|下页|下一个|»|›|>|＞)$/;
+        for (var i = 0; i < els.length; i++) {
+            var el = els[i];
+            if (!isVisible(el) || el.disabled) continue;
+            var label = el.getAttribute ? (el.getAttribute('aria-label') || el.getAttribute('title') || '') : '';
+            var txt = cleanText((el.textContent || '').slice(0, 8));
+            if (NEXT_TEXT.test(txt) || /下一页|下一张/.test(label)) return el;
+            var cls = String(el.className || '');
+            if (/next|Next|turnRight|arrow-right|arrowRight/.test(cls) && el.clientWidth > 0 && el.clientWidth < 200) return el;
+        }
+        return null;
+    }
+
+    // 当前页的页码信息（“3/12”或新版缩略图 is-active 序号）
+    function docPageInfo() {
+        var thumbs = document.querySelectorAll('.mooc-docs-reader__thumbnail, [class*="mooc-docs-reader__thumbnail"]');
+        if (thumbs.length > 0) {
+            var cur = 0;
+            for (var t = 0; t < thumbs.length; t++) {
+                if (thumbs[t].classList.contains('is-active')) { cur = t + 1; break; }
+            }
+            return { cur: cur, total: thumbs.length };
+        }
+        var els = document.querySelectorAll(
+            '[class*="pageNum"], [class*="page-num"], [class*="pageInfo"], [class*="page-info"], ' +
+            '[class*="pager"], [class*="pagination"], [class*="indicator"], .zpgi, .zcnt'
+        );
+        for (var i = 0; i < els.length; i++) {
+            var m = (els[i].textContent || '').match(/(\d+)\s*\/\s*(\d+)/);
+            if (m) return { cur: parseInt(m[1], 10), total: parseInt(m[2], 10) };
+        }
+        return null;
+    }
+
+    // 当前可见文档页的“指纹”（缩略图激活位 / 主图 src / 内容摘要），用于判断翻页是否生效
+    function docPageSignature() {
+        var scope = findDocViewer();
+        if (!scope) return '';
+        var thumbs = scope.querySelectorAll('.mooc-docs-reader__thumbnail, [class*="mooc-docs-reader__thumbnail"]');
+        if (thumbs.length > 0) {
+            var cur = 0;
+            for (var t = 0; t < thumbs.length; t++) {
+                if (thumbs[t].classList.contains('is-active')) { cur = t + 1; break; }
+            }
+            return 'reader:' + cur + '/' + thumbs.length;
+        }
+        var imgs = scope.querySelectorAll('img');
+        for (var i = 0; i < imgs.length; i++) {
+            var im = imgs[i];
+            if (isVisible(im) && im.src && im.clientWidth >= 100) return im.src;
+        }
+        var txt = scope.textContent || '';
+        return String(txt.length) + ':' + txt.slice(-60);
+    }
+
+    // 没有翻页按钮的长文档：每 1 秒滚动一屏，滚不动即到底
+    async function scrollDocFallback() {
+        var viewer = findDocViewer();
+        var sc = (viewer && viewer.scrollHeight > viewer.clientHeight + 40) ? viewer : (document.scrollingElement || document.documentElement);
+        var before = sc.scrollTop;
+        sc.scrollTop += Math.max(300, Math.min(800, window.innerHeight * 0.7));
+        await sleep(CONFIG.LEARN_DOC_PAGE_MS);
+        return sc.scrollTop > before + 10;
+    }
+
+    // 文档内容：自动翻页，每页停留 1 秒
+    async function learnDocItem() {
+        logDebug('doc', '开始自动翻页（每页 1 秒）...');
+        updateStatus('📄 检测到文档，开始自动翻页（每页 1 秒）...');
+        var flips = 0, stale = 0, lastSig = docPageSignature(), lastInfo = docPageInfo();
+        while (!taskState.cancelled && flips < CONFIG.LEARN_MAX_PAGE_FLIPS) {
+            // 用户点了【下一节】→ 跳过当前文档
+            if (manualWaitFlag) { logDebug('doc', '用户点击【下一节】，跳过当前文档'); updateStatus('⏭ 用户点击【下一节】，跳过当前文档'); return true; }
+            var btn = findDocNextBtn();
+            if (!btn) {
+                // 新版缩略图阅读器：没有下一页按钮就说明已在最后一页，直接完成
+                var info = docPageInfo();
+                if (info && info.total > 0) {
+                    logDebug('doc', '翻页结束（已到最后一页 ' + info.cur + '/' + info.total + '）');
+                    updateStatus('📄 文档翻页结束（已到最后一页），进入下一个内容');
+                    return true;
+                }
+                var moved = await scrollDocFallback();
+                if (!moved) { logDebug('doc', '已到文档末尾（无翻页按钮）'); updateStatus('📄 已到文档末尾（无翻页按钮），进入下一个内容'); return true; }
+                continue;
+            }
+            realClick(btn);
+            await sleep(CONFIG.LEARN_DOC_PAGE_MS);
+            flips++;
+            var sig = docPageSignature();
+            var info2 = docPageInfo();
+            var changed = (sig && sig !== lastSig) || (info2 && lastInfo && (info2.cur > lastInfo.cur || info2.total !== lastInfo.total));
+            if (changed) { stale = 0; lastSig = sig || lastSig; lastInfo = info2 || lastInfo; }
+            else {
+                stale++;
+                if (stale >= 3) { logDebug('doc', '翻页结束（连续 ' + stale + ' 页无变化）'); updateStatus('📄 文档翻页结束（已到最后一页），进入下一个内容'); return true; }
+            }
+            if (flips % 10 === 0) updateStatus('📄 文档翻页中... 已翻 ' + flips + ' 页');
+        }
+        logDebug('doc', '文档处理完成（翻 ' + flips + ' 页）');
+        updateStatus('📄 文档处理完成，进入下一个内容');
+        return true;
+    }
+
+    // 独立测验：只停留片刻（不自动作答，避免消耗答题次数）
+    async function learnQuizItem() {
+        updateStatus('📝 检测到独立测验内容：停留片刻，不自动作答（避免消耗答题次数），随后继续');
+        await sleep(CONFIG.LEARN_QUIZ_VISIT_MS);
+        await dismissModal();
+        return true;
+    }
+
+    // 讨论内容：自动回复
+    async function learnDiscussionItem() {
+        updateStatus('💬 检测到讨论内容，自动回复...');
+        await replyDiscussion();
+        await sleep(1000);
+        return true;
+    }
+
+    // 其它（富文本课件等）：停留片刻
+    async function learnOtherItem() {
+        updateStatus('📄 其它类型内容（富文本/网页课件），停留片刻后继续...');
+        await sleep(CONFIG.LEARN_OTHER_VISIT_MS);
+        return true;
+    }
+
+    // 在页面里找目标 ID 对应的目录链接（SPA 真实点击不会整页刷新）
+    function findContentElById(id) {
+        var links = learnContentLinks();
+        for (var i = 0; i < links.length; i++) {
+            if (links[i].id === id && links[i].el) return links[i].el;
+        }
+        return null;
+    }
+
+    // 宽松版：全页面找目标 ID 对应的链接（不要求归属到章），用于跳转兜底。
+    // 安全约束：<a> 的 href 必须真的指向目标 ID（/content/{id} 或 id={id}），
+    //           否则跳过——避免点到课程首页/公告这类杂项链接。
+    function findAnyContentElById(id) {
+        var els = document.querySelectorAll('a[href*="/content/"], a[href*="id="], [data-content-id], [data-id]');
+        var coursePrefix = learnCoursePrefix();
+        for (var i = 0; i < els.length; i++) {
+            if (linkIdOf(els[i]) !== id) continue;
+            if (els[i].tagName === 'A') {
+                var ah = els[i].getAttribute('href') || '';
+                if (!(new RegExp('/content/' + id + '(?![0-9])').test(ah) || ah.indexOf('id=' + id) !== -1)) continue;
+                if (coursePrefix && ah.indexOf('#') !== 0 && ah.indexOf(coursePrefix) !== 0) continue;
+            }
+            return els[i];
+        }
+        return null;
+    }
+
+    // 构造新版路径路由的跳转地址：只替换 content/{id}，保留 tid，
+    // 但清掉 unitId/chapterId——它们必须与新内容匹配，拿不到正确值宁可交给平台自己解析，
+    // 也不能带旧的（否则平台报“unitId 与 lessonId 不匹配”课件不存在）。
+    function buildContentUrl(id) {
+        try {
+            var u = new URL(location.href);
+            u.pathname = u.pathname.replace(/\/content\/\d+/, '/content/' + id);
+            var sp = new URLSearchParams(u.search);
+            var tid = sp.get('tid');
+            sp.delete('unitId'); sp.delete('chapterId'); sp.delete('sm');
+            if (tid) sp.set('tid', tid);
+            u.search = sp.toString();
+            return u.href;
+        } catch (e) {
+            return location.href.replace(/\/content\/\d+/, '/content/' + id);
+        }
+    }
+
+    // 跳转到指定内容。target 可以是 {id, href, el}，也可以是数字 id。
+    // 新版路径路由（/content/{id}?tid=...&unitId=...&chapterId=...）与旧版 hash 路由都支持。
+    // 顺序：① 真实点击目录里的链接（SPA 内部路由，不刷新、参数全对）；
+    //       ② 用目录链接的完整 href 跳转（含正确 unitId/chapterId）；
+    //       ③ 都没有时按当前 URL 换 content id（并清掉可能不匹配的 unitId/chapterId）。
+    // 安全约束：点击/使用某个链接前，必须确认它的 href 真的指向目标 ID，
+    //           否则宁可自己构造 URL，也不点杂项链接（避免跳到 content/3 这种假地址）。
+    async function gotoContent(target) {
+        var id = (typeof target === 'object' && target) ? target.id : target;
+        var href = (typeof target === 'object' && target) ? (target.href || '') : '';
+        var el = (typeof target === 'object' && target && target.el) || findContentElById(id) || findAnyContentElById(id);
+        if (el) {
+            var elHref = (el.getAttribute && el.getAttribute('href')) || '';
+            // 只采纳「href 里明确含目标 ID」的完整链接；其余一律当没有
+            if (elHref && elHref.indexOf('#') !== 0 &&
+                (new RegExp('/content/' + id + '(?![0-9])').test(elHref) || elHref.indexOf('id=' + id) !== -1)) {
+                href = elHref;
+            } else {
+                el = null; // href 与目标 ID 对不上：不点击、不使用
+            }
+        }
+
+        if (el && el.tagName === 'A' && isVisible(el)) {
+            try { realClick(el); } catch (e) {}
+            await sleep(600);
+            if (learnCurrentContentId() === id) { await sleep(400); return; }
+            // 没生效，继续走 URL 跳转兜底
+        }
+
+        var curHref = location.href, curHash = location.hash;
+        var next = null;
+        if (href) {
+            if (href.indexOf('#') !== -1) {
+                var hashPart = href.slice(href.indexOf('#'));
+                if (/id=(\d+)/.test(hashPart)) next = hashPart; // 旧版：沿用目录链接的 hash
+            } else if (/\/content\/\d+/.test(href) || /\/mooc\/learn\//.test(href)) {
+                next = href; // 新版：完整链接（含 tid/unitId/chapterId，参数正确）
+            }
+        }
+        if (!next) {
+            if (/\/content\/\d+/.test(curHref)) {
+                next = buildContentUrl(id); // 保留 tid，清掉可能不匹配的 unitId/chapterId
+            } else if (/id=\d+/.test(curHash)) {
+                next = curHash.replace(/id=\d+/, 'id=' + id); // 旧版 hash 路由
+            }
+        }
+        if (next) {
+            if (next.indexOf('#') === 0) { if (next !== curHash) location.hash = next; }
+            else { if (next !== curHref) location.href = next; }
+        }
+        var t0 = Date.now();
+        while (Date.now() - t0 < CONFIG.LEARN_NAV_WAIT) {
+            if (taskState.cancelled) throw makeCancelError();
+            if (learnCurrentContentId() === id) { await sleep(500); return; }
+            await sleep(250);
+        }
+    }
+
+    // 判定“当前是不是讨论页”要偏严：自动学习里若误判，会把回复文本填进搜索框。
+    // 要求有 hash 特征，或命中了回复列表容器，或编辑器周围带明显的回复/评论字样。
+    function looksLikeDiscussionPage() {
+        if (/forumdetail|forum|discuss|discussion|topic/i.test(location.hash)) return true;
+        if (collectCandidates(document, DISCUSS.listSelectors, 10).length > 0) return true;
+        var els = document.querySelectorAll('textarea, [contenteditable="true"]');
+        for (var i = 0; i < els.length; i++) {
+            if (!isVisible(els[i])) continue;
+            var scope = els[i].closest('[class*="reply"], [class*="comment"], [class*="editor"], [class*="discuss"], [class*="post"], form');
+            if (scope) {
+                var txt = cleanText(scope.textContent).slice(0, 200);
+                if (/回复|评论|发表|发布|讨论/.test(txt)) return true;
+            }
+        }
+        return false;
+    }
+
+    // 当前页面类型：quiz / discussion / video / doc / other
+    function detectContentType() {
+        var href = location.href, hash = location.hash;
+        // 课件加载失败页（unitId 与 lessonId 不匹配等）→ 快速跳过，不停留
+        var bodyHead = cleanText((document.body ? document.body.textContent : '') || '').slice(0, 300);
+        if (/课件不存在|课件加载失败|unitId[\s\S]{0,20}不匹配|lessonId[\s\S]{0,20}不匹配|内容不存在|资源不存在/.test(bodyHead)) { logDebug('type', 'missing：页面显示课件不存在/unitId不匹配类文案'); return 'missing'; }
+        // SPOC 老式 DOM 与 MOOC 新版完全不同，先走 SPOC 判定；认不出来再走通用判定
+        if (isSpocCourse()) {
+            var spocType = spocDetectContentType();
+            if (spocType) return spocType;
+        }
+        // 当前内容标签声明的类型最可靠，优先于任何 DOM 猜测。
+        // 切到「测试」时旧的文档查看器还在页面上，先看元素就会把测验判成文档。
+        var tabKind = contentKindFromTab(currentContentTab());
+        if (tabKind) { logDebug('type', tabKind + '：当前内容标签的类型标记命中'); return tabKind; }
+        // 随堂测验的容器类名（LessonQuizUnit 等）比题块类名更稳定，
+        // 新版页面题块常是普通 <article>，只看 questionItem 类会漏判
+        if (PAGE_CONFIG.quizUrl.test(href) || hasVisibleQuestionBlocks() || lqScope()) { logDebug('type', 'quiz：URL 命中测验路由或检测到题目块'); return 'quiz'; }
+        if (looksLikeDiscussionPage()) { logDebug('type', 'discussion：讨论页特征命中'); return 'discussion'; }
+        if (findVideo()) { logDebug('type', 'video：检测到可见 video 元素'); return 'video'; }
+        if (findDocViewer()) { logDebug('type', 'doc：检测到文档查看器'); return 'doc'; }
+        logDebug('type', 'other：未命中视频/文档/讨论/测验特征（富文本/节标题页等）');
+        return 'other';
+    }
+
+    // ---- 自动学习的跨页面续跑状态 ----
+    // 新版 UI 是路径路由：跳转内容 = 整页刷新，页面刷新后脚本重新初始化，
+    // 内存里的循环会断掉。所以把「计划」写进 localStorage，每次刷新后由
+    // resumeLearn() 接着跑；点“停止”或手动切走则清除状态。
+    var LEARN_STATE_KEY = 'mar.learn.state.v2'; // v2：清掉旧版残留的脏计划
+
+    function learnSaveState(st) {
+        try { localStorage.setItem(LEARN_STATE_KEY, JSON.stringify(st)); } catch (e) {}
+    }
+    function learnLoadState() {
+        try {
+            var s = localStorage.getItem(LEARN_STATE_KEY);
+            if (!s) return null;
+            var o = JSON.parse(s);
+            return o && o.running ? o : null;
+        } catch (e) { return null; }
+    }
+    function learnClearState() {
+        try { localStorage.removeItem(LEARN_STATE_KEY); } catch (e) {}
+    }
+
+    // ---- 跳转后强制停留 ----
+    // 页面刚切过去时，DOM 往往还是上一份内容：视频元素、题块、正文都还在，
+    // 立即判定会认错类型，甚至把「还没开始的内容」当成已完成而马上跳到下一节。
+    // 所以每次跳转成功后先记下时刻，下一轮处理前强制等满 LEARN_JUMP_SETTLE_MS。
+    // 记在 localStorage 里是必须的：MOOC 新版是整页刷新路由，内存变量会丢。
+    var lastJumpAt = 0;
+
+    // 登记「跳过去之后我应该站在哪个内容上」。
+    // 这一步是为了对付平台的“自动播放下一集”：已看完的视频进去约 5 秒后，
+    // 平台会自己跳到下一集视频，把夹在中间的文档/测验/讨论整段跨过去。
+    // 有了预期，等待期间就能发现被顶掉并切回来。
+    function learnSetExpect(key, kind) {
+        var st = learnLoadState();
+        if (!st) return;
+        st.expectKey = key || '';
+        st.expectKind = kind || '';
+        learnSaveState(st);
+    }
+
+    function learnMarkJump() {
+        lastJumpAt = Date.now();
+        var st = learnLoadState();
+        if (st) { st.jumpAt = lastJumpAt; learnSaveState(st); }
+        var expect = (st && st.expectKey) ? '，预期内容=「' + String(st.expectKey).slice(0, 20) + '」' : '';
+        logDebug('learn', '已记录跳转时刻，接下来强制等待 '
+            + Math.round(CONFIG.LEARN_JUMP_SETTLE_MS / 1000) + ' 秒再处理新内容' + expect);
+    }
+
+    // 两个标签键是否指同一个内容（容忍平台给 aria-label 追加状态词/时长）
+    function sameTabKey(a, b) {
+        if (!a || !b) return false;
+        if (a === b) return true;
+        if (a.indexOf(b) !== -1 || b.indexOf(a) !== -1) return true;
+        var ca = codeKeyOf(a), cb = codeKeyOf(b);
+        return !!(ca && cb && ca === cb);
+    }
+
+    // 视频是否已经播完（用来判断“落点是不是一个此前已看完的视频”）
+    function videoWatchedOut(v) {
+        if (!v) return false;
+        if (v.__marEndedFlag || v.ended) return true;
+        var d = v.duration;
+        if (d && d > 0 && isFinite(d) && v.currentTime >= d - CONFIG.LEARN_VIDEO_END_MARGIN) return true;
+        return false;
+    }
+
+    // 内容标签上是否带“已学完”标记（平台会用图标/文字标注）
+    function tabLooksDone(tab) {
+        if (!tab) return false;
+        if (/已学完|已完成|已看完/.test(tabLabel(tab))) return true;
+        try {
+            if (tab.querySelector('[aria-label*="已学完"], [aria-label*="完成"], [class*="complete"], [class*="finished"]')) return true;
+        } catch (e) {}
+        return false;
+    }
+
+    // 关掉平台自带的「自动播放下一集」。
+    // 老代码只认 input.j-autoNext，新版 UI 换过几轮 class，这里多认几种；
+    // 关不掉也照样往下走（等待期间还有“被带走就切回来”的兜底）。
+    function turnOffPlatformAutoNext() {
+        var inputs = [], i;
+        var sels = ['input.j-autoNext', 'input[class*="autoNext"]', 'input[class*="auto-next"]',
+            '[class*="autoNext"] input', '[class*="auto-next"] input'];
+        for (i = 0; i < sels.length; i++) {
+            var els;
+            try { els = document.querySelectorAll(sels[i]); } catch (e) { continue; }
+            for (var j = 0; j < els.length; j++) if (inputs.indexOf(els[j]) === -1) inputs.push(els[j]);
+        }
+        // 文案兜底：label / 开关容器里带「自动播放」的
+        var boxes = document.querySelectorAll('label, [class*="switch"], [class*="toggle"]');
+        for (i = 0; i < boxes.length; i++) {
+            var t = cleanText(boxes[i].textContent || '');
+            if (!t || t.length > 30 || !/自动播放/.test(t)) continue;
+            var inp = boxes[i].querySelector('input[type="checkbox"]');
+            if (inp && inputs.indexOf(inp) === -1) inputs.push(inp);
+        }
+        var off = 0;
+        for (i = 0; i < inputs.length; i++) {
+            if (inputs[i].checked) { realClick(inputs[i]); off++; }
+        }
+        if (off) logDebug('learn', '已关闭平台「自动播放下一集」开关 ' + off + ' 个');
+        return off;
+    }
+
+    async function waitJumpSettle() {
+        var st = learnLoadState();
+        var at = Math.max(lastJumpAt, (st && st.jumpAt) || 0);
+        if (!at) return;   // 首次开始学习（没有跳转过），不等
+        var expectKey = (st && st.expectKey) || '';
+        var expectKind = (st && st.expectKind) || '';
+        var total = CONFIG.LEARN_JUMP_SETTLE_MS;
+        var left = total - (Date.now() - at);
+        if (left <= 0) {
+            logDebug('learn', '距上次跳转已超过 ' + Math.round(total / 1000) + ' 秒，无需再等');
+            return;
+        }
+        // 先把平台的自动下一集关掉，再开始等 —— 否则等的这段时间正好是它抢跑的时间
+        turnOffPlatformAutoNext();
+
+        logDebug('learn', '跳转后强制停留：还需等 ' + Math.ceil(left / 1000) + ' 秒'
+            + (expectKey ? '（预期内容=「' + String(expectKey).slice(0, 20) + '」）' : ''));
+        var t0 = Date.now();
+        var hardEnd = t0 + total + 30000;   // 反复切回也别无限等
+        var recoverTries = 0;
+        var warnedMissing = false;
+        var fastApplied = false;
+        var lastSec = -1;
+
+        while (true) {
+            if (taskState.cancelled) return;
+            if (manualWaitFlag) { logDebug('learn', '强制停留期间用户点了【下一节】，提前结束等待'); return; }
+            // 默认硬等满 10 秒；只有「停止」、用户主动点的【下一节】、以及下面两种
+            // 需要抢跑的例外能提前结束。
+            left = total - (Date.now() - t0);
+            if (left <= 0 || Date.now() > hardEnd) break;
+
+            var cur = currentContentTab();
+            var curKey = cur ? tabKey(cur) : '';
+
+            // ① 等待期间内容被平台自动切走 → 立刻切回预期内容
+            if (expectKey && curKey && !sameTabKey(curKey, expectKey)) {
+                var back = findTabByKey(expectKey);
+                if (back && recoverTries < 2) {
+                    recoverTries++;
+                    logDebug('learn', '⚠️ 等待期间内容被平台切走：「' + curKey.slice(0, 20)
+                        + '」≠ 预期「' + expectKey.slice(0, 20) + '」，尝试切回（第 ' + recoverTries + ' 次）');
+                    realClick(back);
+                    if (await waitForTabActive(back, 3000)) {
+                        updateStatus('↩️ 平台自动跳到了下一个视频，已切回原内容继续处理...');
+                        t0 = Date.now();
+                        lastSec = -1;
+                        continue;
+                    }
+                    logDebug('learn', '⚠️ 切回没生效，继续等待后再处理');
+                } else if (!back) {
+                    // 当前内容条里已经找不到预期内容：多半连小节都被平台带走了。
+                    // 这时切不回去，也不急着提前结束（可能是 SPOC 或结构识别差异），
+                    // 只记一条警告，等剩余时间走完后按眼前内容处理。
+                    if (!warnedMissing) {
+                        warnedMissing = true;
+                        logDebug('learn', '⚠️ 已找不到预期内容「' + expectKey.slice(0, 20)
+                            + '」（可能连小节一起被平台跳走），稍后按当前内容继续');
+                    }
+                }
+            }
+
+            // ② 落点是「此前已看完的视频」→ 不等满，抢在平台 5 秒自动跳转之前接管。
+            //    这正是“中间的文档/测验/讨论被跳过”的根因：硬等 10 秒，
+            //    平台早就跳到下一个视频去了。
+            //    只留 LEARN_JUMP_SETTLE_FAST_MS 的短窗口（给 DOM 一点确认时间），
+            //    随后由脚本自己按内容条顺序前进。
+            var kind = expectKind || contentKindFromTab(cur);
+            if (kind === 'video') {
+                var v = findVideo();
+                // v !== learnLastVideoEl：排除上一段视频残留的节点（它也停在结尾）
+                if ((v && v !== learnLastVideoEl && videoWatchedOut(v)) || tabLooksDone(cur)) {
+                    if (!fastApplied) {
+                        fastApplied = true;
+                        total = CONFIG.LEARN_JUMP_SETTLE_FAST_MS;
+                        t0 = Date.now();
+                        lastSec = -1;
+                        logDebug('learn', '落点是已看完的视频（' + (v ? 'currentTime≈duration' : '标签带已学完标记')
+                            + '），把强制等待压缩到 ' + total + 'ms，抢在平台自动跳转前接管');
+                        updateStatus('⏭ 该视频此前已看完：不再空等，确认后直接进入下一个内容...');
+                    }
+                }
+            }
+
+            var sec = Math.ceil(left / 1000);
+            if (sec !== lastSec) {
+                lastSec = sec;
+                updateStatus('⏳ 刚切换到新内容，强制等待 ' + sec + ' 秒后再开始处理（可点右下角【下一节】提前跳过）...');
+            }
+            await sleep(300);
+        }
+        logDebug('learn', '强制停留结束，开始处理当前内容');
+    }
+
+    // ===================== 新版 DOM 导航核心（tablist + 章节/小节下拉） =====================
+    // 页面结构（用户提供）：
+    //   · 顶部导航：章节/小节下拉按钮 <button aria-expanded="false" aria-label="章节名/小节名" type="button">
+    //   · 内容标签栏：<div role="tablist"> 内多个 <button role="tab" aria-label="内容名" type="button">，
+    //     当前激活的带 aria-selected="true"
+    //   · SPA 单页应用：跳转一律用 .click() 模拟点击，绝不直接改 URL
+    // 跳转优先级：①同小节（tab 下一个兄弟）→ ②跨小节（小节下拉下一项）→ ③跨章节（章节下拉下一章）
+
+    // 通用：等待元素出现（Promise），超时返回 null；中途取消也返回 null
+    function waitForElement(selector, timeout, root) {
+        return new Promise(function (resolve) {
+            var t0 = Date.now();
+            (function check() {
+                if (taskState.cancelled) { resolve(null); return; }
+                var el;
+                try { el = (root || document).querySelector(selector); } catch (e) { el = null; }
+                if (el && isVisible(el)) { resolve(el); return; }
+                if (Date.now() - t0 >= timeout) { resolve(null); return; }
+                setTimeout(check, 200);
+            })();
+        });
+    }
+
+    // 等待某个内容标签成为激活项。
+    // 注意：不能只看 aria-selected —— 新版内容条是 tailwind 版的普通 button，
+    // 激活态由颜色 class 表示（text-[#00cc7e] / bg-primary-50，参考 Auto_Mooc 的做法），
+    // 死等 aria-selected 会在这种页面上空转满 5 秒然后误判“点击没生效”。
+    async function waitForTabActive(tab, timeoutMs) {
+        var limit = timeoutMs || CONFIG.LEARN_NAV_WAIT;
+        var t0 = Date.now();
+        while (Date.now() - t0 < limit) {
+            if (taskState.cancelled) return false;
+            if (tabIsActive(tab)) return true;
+            await sleep(200);
+        }
+        return tabIsActive(tab);
+    }
+
+    // 标签文本（优先 aria-label，其次可见文本）
+    function tabLabel(tab) {
+        if (!tab) return '';
+        var l = (tab.getAttribute && (tab.getAttribute('aria-label') || tab.getAttribute('title'))) || '';
+        var t = cleanText(tab.textContent || '');
+        return (l || t || '').slice(0, 40);
+    }
+
+    // 标签的归一化唯一键：用于「跳转后确认我还在预期的那一项上」。
+    function tabKey(tab) {
+        return normMatch(tabLabel(tab));
+    }
+
+    // 标签是否处于激活态：aria-selected 优先，其次认新版 UI 的激活 class。
+    function tabIsActive(tab) {
+        if (!tab) return false;
+        if (tab.getAttribute && tab.getAttribute('aria-selected') === 'true') return true;
+        var cls = typeof tab.className === 'string'
+            ? tab.className
+            : (tab.getAttribute ? (tab.getAttribute('class') || '') : '');
+        if (!cls) return false;
+        return /text-\[#00cc7e\]|bg-primary-50|(^|\s)current(\s|$)|(^|\s)selected(\s|$)|(^|\s)active(\s|$)|is-active/i.test(cls);
+    }
+
+    // 内容条容器候选：新版是 .learn-unit-tabs-scroll（参考仓库用的就是它），
+    // 老版是 [role="tablist"]。两者都收，避免平台改一次结构就整条导航失效。
+    function contentStrips() {
+        var out = [];
+        var sels = ['.learn-unit-tabs-scroll', '[role="tablist"]'];
+        for (var s = 0; s < sels.length; s++) {
+            var els;
+            try { els = document.querySelectorAll(sels[s]); } catch (e) { continue; }
+            for (var i = 0; i < els.length; i++) {
+                var el = els[i];
+                if (!isVisible(el)) continue;
+                // 去掉被已收录容器包住的重复项
+                var dup = false;
+                for (var j = 0; j < out.length; j++) {
+                    if (out[j] === el || out[j].contains(el)) { dup = true; break; }
+                }
+                if (!dup) out.push(el);
+            }
+        }
+        return out;
+    }
+
+    // 取某个内容条里的内容标签（按 DOM 顺序）。
+    // 关键修复：不再假设「tab 的兄弟节点就是 tab」。新版 UI 把每个 tab 包在
+    // <li>/<div> 里，用 nextElementSibling 走一步就 null → 整节剩余内容被当成
+    // 「本节已结束」而直接跳章，文档/测验/讨论就这样被漏掉。
+    function tabsOfStrip(strip) {
+        if (!strip) return [];
+        // 无条件同时认 [role="tab"] 和 button：
+        //   · 老版内容条是 button[role="tab"]
+        //   · 新版 .learn-unit-tabs-scroll 里是普通 button（激活态靠颜色 class）
+        // 只按 role 取会在新版页面上拿到 0 项，整条导航直接失效。
+        var nodes = strip.querySelectorAll('[role="tab"], button');
+        var out = [];
+        for (var i = 0; i < nodes.length; i++) {
+            var el = nodes[i];
+            if (!isVisible(el)) continue;
+            if (el.getAttribute && el.getAttribute('aria-expanded')) continue; // 下拉/展开按钮不是内容
+            var label = tabLabel(el);
+            if (!label) continue;
+            // 滚动箭头 / 下拉 / 更多 之类的操作按钮不是内容项，混进来会让索引错位
+            if (/更多|收起|展开|滚动|向左|向右|上一章|下一章|上一节|下一节|scroll|prev|next/i.test(label)) continue;
+            out.push(el);
+        }
+        return out;
+    }
+
+    // 当前「正在用」的内容条：优先含激活标签的那条，避免页面上另有 tablist
+    //（目录/资料/公告之类的页签）时把它的第一项当成内容项。
+    function currentStrip() {
+        var strips = contentStrips();
+        var i, j, ts;
+        for (i = 0; i < strips.length; i++) {
+            ts = tabsOfStrip(strips[i]);
+            for (j = 0; j < ts.length; j++) if (tabIsActive(ts[j])) return strips[i];
+        }
+        return strips.length === 1 ? strips[0] : null;
+    }
+
+    // 当前激活的内容标签
+    function currentContentTab() {
+        var strips = contentStrips();
+        var i, j, ts;
+        for (i = 0; i < strips.length; i++) {
+            ts = tabsOfStrip(strips[i]);
+            for (j = 0; j < ts.length; j++) if (tabIsActive(ts[j])) return ts[j];
+        }
+        // 回退：老版页面用 [role="tab"][aria-selected="true"]
+        var tabs = document.querySelectorAll('[role="tab"][aria-selected="true"]');
+        for (i = 0; i < tabs.length; i++) if (isVisible(tabs[i])) return tabs[i];
+        return null;
+    }
+
+    // 按 key 在当前内容条里找标签（跳转后被平台带走时用来切回来）
+    function findTabByKey(key) {
+        if (!key) return null;
+        var tabs = contentTabs();
+        for (var i = 0; i < tabs.length; i++) if (tabKey(tabs[i]) === key) return tabs[i];
+        return null;
+    }
+
+    // 内容标签自带的类型标记。平台给每个内容标签画了图标：
+    //   <button role="tab" aria-label="测试"><svg data-lesson-type-icon="quiz">
+    //   <button role="tab" aria-label="课件"><svg data-lesson-type-icon="pdf">
+    // 这比「页面上出现了什么元素」可靠得多：切换标签时旧内容的 DOM 往往
+    // 还留在页面里（文档查看器尤其明显），只看元素会把测验页判成文档，
+    // 然后「文档没有翻页按钮」→ 立刻跳走，测验就被这样跳过了。
+    function contentKindFromTab(tab) {
+        if (!tab) return null;
+        var icon = (tab.getAttribute && tab.getAttribute('data-lesson-type-icon')) || '';
+        if (!icon) {
+            var svg = null;
+            try { svg = tab.querySelector('[data-lesson-type-icon]'); } catch (e) { svg = null; }
+            if (svg) icon = svg.getAttribute('data-lesson-type-icon') || '';
+        }
+        var label = (tab.getAttribute && (tab.getAttribute('aria-label') || '')) || '';
+        var txt = cleanText(tab.textContent || '');
+        var s = (icon + ' ' + label + ' ' + txt).toLowerCase();
+        if (/quiz|exam|test|测验|测试|自测|小测|作业/.test(s)) return 'quiz';
+        if (/video|视频|音频/.test(s)) return 'video';
+        if (/discuss|forum|bbs|讨论/.test(s)) return 'discussion';
+        if (/pdf|ppt|pptx|doc|word|excel|课件|文档|讲义|附件|资料/.test(s)) return 'doc';
+        return null;
+    }
+
+    // 收集当前内容条里的全部内容标签（按 DOM 顺序）。
+    // 只取「正在用的那一条」，不再把页面上所有 tablist 混在一起 ——
+    // 混在一起时 firstTabInLesson 可能拿到别的页签里的第一项，一跳就跳到别处。
+    function contentTabs() {
+        var strip = currentStrip();
+        if (strip) return tabsOfStrip(strip);
+        var strips = contentStrips();
+        var out = [];
+        for (var s = 0; s < strips.length; s++) {
+            var ts = tabsOfStrip(strips[s]);
+            for (var i = 0; i < ts.length; i++) out.push(ts[i]);
+        }
+        return out;
+    }
+
+    // 顶部导航里的章节/小节下拉按钮。
+    // 真实页面（用户提供）：
+    //   · 章节按钮 aria-label="第四章 坚持以人民为中心"（匹配章标题）
+    //   · 小节按钮 aria-label="4.2.2 依靠人民创造历史伟业"（数字编号 + 名字）
+    //   · 干扰按钮：两个无 label 的 learn-header-action、「更多课程操作」learn-header-more-toggle、
+    //     「打开文科AI助教」learn-agent-launcher —— 必须排除，否则小节按钮会被「更多课程操作」抢走，
+    //     导致跨小节时展开错误的下拉 → 匹配失败 → 误判“小节已结束” → 误跳章节。
+    function headerDropdowns() {
+        var btns = document.querySelectorAll('header button[aria-expanded], [class*="header"] button[aria-expanded], nav button[aria-expanded], button[aria-expanded]');
+        var chapter = null, section = null;
+        for (var i = 0; i < btns.length; i++) {
+            if (!isVisible(btns[i])) continue;
+            var label = btns[i].getAttribute('aria-label') || '';
+            if (!label) continue;
+            var cls = typeof btns[i].className === 'string' ? btns[i].className : (btns[i].getAttribute ? (btns[i].getAttribute('class') || '') : '');
+            // 黑名单：排除平台的功能按钮（更多课程操作 / 文科AI助教 / 无意义的 header-action）
+            if (/learn-header-action|learn-header-more|learn-agent|more-toggle|more-menu/.test(cls)) continue;
+            if (/更多课程操作|打开.*助教|更多|收起|关闭/.test(label)) continue;
+            if (looksLikeChapterHeading(label)) { if (!chapter) chapter = btns[i]; }
+            else { if (!section) section = btns[i]; }
+        }
+        logDebug('nav', '章节按钮=' + (chapter ? (chapter.getAttribute('aria-label') || '?') : '未找到')
+            + ' | 小节按钮=' + (section ? (section.getAttribute('aria-label') || '?') : '未找到'));
+        return { chapter: chapter, section: section };
+    }
+
+    // 下拉菜单里“可点项”的候选选择器（下拉展开后的 DOM 未知，多给几组候选）
+    function menuItemSels() {
+        return [
+            '[role="menuitem"]', '[role="option"]', '[class*="menuitem"]', '[class*="menu-item"]',
+            '[class*="dropdown"] a', '[class*="dropdown"] li', '[class*="dropdown"] button',
+            '[class*="popover"] a', '[class*="popover"] li', '[class*="popup"] a', '[class*="popup"] li',
+            '[class*="option"]', '[class*="choice"]', '[class*="select"] a', '[class*="select"] li',
+            'a', 'li', 'button',
+        ];
+    }
+
+    // 展开下拉按钮，返回展开后的面板容器（找不到返回 null）。
+    // 健壮策略：点击前记录候选面板 → 点击 → 优先找「新出现」的面板；
+    // 若下拉本就处于展开态（无新面板），则返回按钮祖先里任意可见面板，
+    // 保证「已展开状态下重新取菜单」也能命中。
+    async function expandDropdown(btn) {
+        if (!btn) return null;
+        var before = collectCandidates(document, ['[role="menu"]', '[role="listbox"]', '[class*="dropdown"]', '[class*="popover"]', '[class*="popup"]', '[class*="select-list"]'], 40);
+        if (btn.getAttribute('aria-expanded') !== 'true') { realClick(btn); }
+        await sleep(400);
+        var fallbackPanel = null;
+        // 1) 从按钮向上找父容器里的面板（优先新出现，其次任意可见）
+        var node = btn;
+        for (var depth = 0; node && depth < 5; depth++) {
+            var parent = node.parentElement;
+            if (!parent) break;
+            var sels = ['[role="menu"]', '[role="listbox"]', '[class*="dropdown-menu"]', '[class*="dropdown"]', '[class*="popover"]', '[class*="popup"]'];
+            for (var s = 0; s < sels.length; s++) {
+                var p;
+                try { p = parent.querySelector(sels[s]); } catch (e) { continue; }
+                if (p && isVisible(p)) {
+                    if (before.indexOf(p) === -1) return p;
+                    if (!fallbackPanel) fallbackPanel = p;
+                }
+            }
+            node = parent;
+        }
+        // 2) 全页面：优先新出现的面板，其次任意可见面板
+        var els = document.querySelectorAll('[role="menu"], [role="listbox"], [class*="dropdown-menu"], [class*="dropdown"], [class*="popover"], [class*="popup"]');
+        var anyPanel = null;
+        for (var i = 0; i < els.length; i++) {
+            if (isVisible(els[i])) {
+                if (before.indexOf(els[i]) === -1) return els[i];
+                if (!anyPanel) anyPanel = els[i];
+            }
+        }
+        return anyPanel || fallbackPanel || null;
+    }
+
+    // 判断元素是不是「可点击单元」：a / button / li / option / menuitem / tab
+    function isClickableEl(el) {
+        var tag = el.tagName;
+        if (tag === 'A' || tag === 'BUTTON' || tag === 'LI') return true;
+        var role = el.getAttribute ? (el.getAttribute('role') || '') : '';
+        return role === 'option' || role === 'menuitem' || role === 'tab' || role === 'button';
+    }
+
+    // 取菜单项的完整文本：如果元素是内部碎片（span 等），提升到它的可点父级（a/li/button）再取文本。
+    // 关键：真实菜单项常是 <li><a><span>4.1.3</span><span>人民立场…</span></a></li>，
+    // 若只读 span 会得到不完整文本，导致与按钮 aria-label 匹配失败 → 误判“没下一项” → 误跳章节。
+    function itemFullText(el) {
+        var node = el;
+        if (el.closest) {
+            var up = el.closest('a, li, button, [role="option"], [role="menuitem"], [role="tab"]');
+            if (up && up !== el) node = up;
+        }
+        return cleanText(node.textContent).slice(0, 40);
+    }
+
+    // 从候选里保留「最外层的可点单元」：有可点祖先在集合里的碎片（span/div）一律丢弃；
+    // 若某项没有可点祖先（纯 div/span 菜单），则原样保留。
+    function dedupeClickable(raw) {
+        var out = [];
+        for (var i = 0; i < raw.length; i++) {
+            var el = raw[i];
+            var skip = false;
+            for (var j = 0; j < raw.length; j++) {
+                if (i !== j && raw[j] !== el && raw[j].contains(el) && isClickableEl(raw[j])) { skip = true; break; }
+            }
+            if (!skip) out.push(el);
+        }
+        return out;
+    }
+
+    // 从候选里保留「最外层的可点单元」，并按 DOM 顺序排序。
+    function menuItemsOf(panel) {
+        var raw = collectCandidates(panel, menuItemSels(), 160);
+        var out = dedupeClickable(raw);
+        out.sort(function (a, b) {
+            if (a.compareDocumentPosition && b.compareDocumentPosition) {
+                return (a.compareDocumentPosition(b) & 4) ? -1 : 1;
+            }
+            return 0;
+        });
+        return out;
+    }
+
+    // 展开下拉后返回菜单项列表。
+    // 优先用面板内的候选；面板找不到时，用「点击前后新出现的可点项」兜底
+    // （展开前记录候选 → 展开后 diff，新出现的项基本就是菜单项）。
+    // 菜单内容多时可以滚动（用户反馈）：若面板内没取到项，先把面板滚到底/中间，
+    // 触发懒渲染/虚拟列表补全后再收一次。
+    async function findDropdownItems(btn) {
+        var before = collectCandidates(document, menuItemSels(), 160);
+        var panel = await expandDropdown(btn);
+        var items = []; // 必须初始化：panel 为 null 时保持空数组，避免后续 items.length 崩溃
+        if (panel) {
+            items = menuItemsOf(panel);
+            if (items.length === 0 && panel.scrollTop !== undefined) {
+                try { panel.scrollTop = panel.scrollHeight; } catch (e) {}
+                await sleep(400);
+                items = menuItemsOf(panel);
+            }
+            if (items.length > 0) return items;
+        }
+        var after = collectCandidates(document, menuItemSels(), 160);
+        var news = [];
+        for (var i = 0; i < after.length; i++) {
+            if (before.indexOf(after[i]) === -1) news.push(after[i]);
+        }
+        var out = dedupeClickable(news);
+        logDebug('menu', '下拉项(面板模式)=' + items.length + ' → diff兜底=' + out.length
+            + ' | 面板=' + (panel ? (panel.className ? String(panel.className).slice(0, 40) : panel.tagName) : 'null'));
+        return out;
+    }
+
+    // 点击下拉菜单选项：先提升到可点父级（span → a/li/button，点击才有效），
+    // 再滚入面板可视区（长菜单/虚拟列表可能未渲染），最后模拟点击。
+    function clickMenuItem(el) {
+        var target = el;
+        if (el.closest) {
+            var up = el.closest('a, li, button, [role="option"], [role="menuitem"], [role="tab"]');
+            if (up && up !== el) target = up;
+        }
+        try { if (target.scrollIntoView) target.scrollIntoView({ block: 'center', inline: 'center' }); } catch (e) {}
+        realClick(target);
+    }
+
+    // 分组标题识别：小节下拉里「第一节 xxx / 第二节 xxx」这类是节的分组标题，
+    // 不是可点进入的内容单元（真实内容单元形如 4.1.1 / 4.2.2）。
+    // 匹配/取下一个时必须跳过它们，否则当前节最后一个内容学完时，
+    // 「下一个」会拿到分组标题而不是下一节的具体内容。
+    // 注意：只认「第X节」，不能误伤章节名（第四章/第五章等 —— 章节下拉菜单里全是章名）。
+    function isGroupTitle(t) {
+        return /^第[一二三四五六七八九十百\d]+\s*节/.test(t) && !/^\s*\d+(\.\d+)+/.test(t);
+    }
+
+    // 匹配用归一化文本：去掉所有空白再比较。
+    // 关键：菜单项常是 <a><span>4.1.3</span><span>人民立场…</span></a>，
+    // textContent 是「4.1.3人民立场…」（无空格），而按钮 aria-label 是「4.1.3 人民立场…」（有空格），
+    // 不去空白会匹配失败 → 误判“没下一项” → 误跳章节。
+    function normMatch(s) {
+        return String(s === null || s === undefined ? '' : s).replace(/\s+/g, '');
+    }
+
+    // 小节/章节的编号前缀（4.2.2、第四章），用于文案匹配失败时的兜底定位。
+    // 名字带空格的差异（「4.2.2 依靠人民…」vs「4.2.2依靠人民…」）虽然 normMatch
+    // 已经抹平，但平台偶尔会在 aria-label 里多塞状态词（「已完成」），编号没变——
+    // 这种情况只有编号能对上，不兜底就会误判「本节是最后一项」→ 直接跳章漏整节。
+    function codeKeyOf(text) {
+        var s = normMatch(text);
+        var m = s.match(/^(\d+(?:\.\d+)+)/);
+        if (m) return m[1];
+        var m2 = s.match(/^第[一二三四五六七八九十百\d]+[章节]/);
+        return m2 ? m2[0] : '';
+    }
+
+    // 上一次菜单匹配的结果，供调用方区分「当前项没找到」和「当前项是最后一项」：
+    // idx=-1 表示没匹配上（结构/文案变了），此时绝不能当成“本节结束”去跳章。
+    var lastMenuMatch = { idx: -1, total: 0, byCode: false };
+
+    // 在菜单项里找「文本与 currentLabel 相似」的项，返回它的下一个；没有下一个返回 null。
+    // 文本相似 = 相等 / 互相包含（归一化空白后比较，精确匹配优先，包含关系兜底），
+    // 最后还有一级「编号相同」兜底。
+    // 文本一律用 itemFullText 取（提升到可点父级），避免 span 碎片导致匹配失败。
+    // 注意：分组标题（第一节/第二节）也参与匹配和取下一个 —— 有些课程里节标题本身可点
+    // （点它进入该节），直接跳过会让用户觉得“第一节/第二节被跳过”。不可点时由
+    // doSectionJump 的兜底逻辑改点该节第一个内容单元。
+    function nextOfMenuItems(items, currentLabel) {
+        lastMenuMatch = { idx: -1, total: (items ? items.length : 0), byCode: false };
+        if (!items || items.length === 0) return null;
+        var target = normMatch(currentLabel);
+        var idx = -1, i, t;
+        for (i = 0; i < items.length; i++) {
+            t = normMatch(itemFullText(items[i]));
+            if (!t) continue;
+            if (target && (t === target || t.indexOf(target) !== -1 || target.indexOf(t) !== -1)) { idx = i; break; }
+        }
+        if (idx === -1) {
+            var code = codeKeyOf(currentLabel);
+            if (code) {
+                for (i = 0; i < items.length; i++) {
+                    if (codeKeyOf(itemFullText(items[i])) === code) { idx = i; lastMenuMatch.byCode = true; break; }
+                }
+                if (idx !== -1) logDebug('menu', '文案没匹配上，改按编号「' + code + '」定位当前项（idx=' + idx + '）');
+            }
+        }
+        lastMenuMatch.idx = idx;
+        lastMenuMatch.total = items.length;
+        if (idx === -1) {
+            logDebug('menu', '⚠️ 菜单里找不到当前项「' + String(currentLabel || '').slice(0, 20) + '」（共 ' + items.length + ' 项）');
+            return null;
+        }
+        var ret = (idx + 1 < items.length) ? items[idx + 1] : null;
+        logDebug('menu', '匹配「' + (String(currentLabel || '').slice(0, 20)) + '」→ idx=' + idx
+            + (ret ? '，下一个=「' + itemFullText(ret).slice(0, 24) + '」' : '，无下一个（当前是最后一项）'));
+        return ret;
+    }
+
+    // —— 跳转三级逻辑 ——
+
+    // 判断内容标签是不是「题目类」内容（随堂测验/自测/小测）
+    function tabIsQuiz(tab) {
+        var label = (tab.getAttribute && (tab.getAttribute('aria-label') || '')) || '';
+        var txt = cleanText((tab.textContent || '')).slice(0, 30);
+        return /测验|测试|考试|自测|小测|quiz/i.test(label) || /测验|测试|考试|自测|小测|quiz/i.test(txt);
+    }
+
+    // 单元测验 / 单元作业 / 考试：这类标签一律不进。
+    // 它们和随堂测验长得像，但通常只有一次机会，进去被自动点了选项就收不回来。
+    // 注意「考试」二字——小节内容条里不会出现，所以按字面排除是安全的。
+    function tabIsExamLike(tab) {
+        var label = (tab.getAttribute && (tab.getAttribute('aria-label') || '')) || '';
+        var txt = cleanText((tab.textContent || '')).slice(0, 30);
+        var s = label + ' ' + txt;
+        return /单元测验|单元测试|单元作业|单元检测|考试|期中|期末|结课|补考/.test(s);
+    }
+
+    // 从当前标签向后找「下一个内容标签」。
+    // 随堂测验也照进不误——自动学习会在里面作答并提交，然后停留 10 秒再走。
+    // 只有单元测验/作业/考试这类才跳过。
+    //
+    // 实现要点（对齐 Auto_Mooc 的 next_pro）：先取「当前标签所在内容条」的
+    // 完整有序列表，再按索引 +1，而不是从当前节点走 nextElementSibling。
+    // 兄弟遍历在两种结构下必坏：①tab 被 <li>/<div> 包着（走一步就 null）；
+    // ②内容条外层还套着滚动容器（兄弟是别的壳）。坏了的表现就是「本节只学了
+    // 第一个，后面的文档/测验/讨论全被跳过」，直接跳下一节。
+    function nextTabInLesson(fromTab) {
+        if (!fromTab) return null;
+        var strip = null;
+        try { strip = fromTab.closest ? fromTab.closest('.learn-unit-tabs-scroll, [role="tablist"]') : null; } catch (e) { strip = null; }
+        var tabs = strip ? tabsOfStrip(strip) : contentTabs();
+        if (!tabs.length) return null;
+
+        var idx = tabs.indexOf(fromTab);
+        if (idx === -1) {
+            // 框架重渲染过，元素引用变了：按 key 定位同一个内容
+            var k = tabKey(fromTab);
+            for (var i = 0; i < tabs.length; i++) if (tabKey(tabs[i]) === k) { idx = i; break; }
+        }
+        if (idx === -1) {
+            logDebug('nav', '⚠️ 当前标签不在内容条列表里（可能是残留节点），按兄弟节点兜底');
+            var s = fromTab, skipped0 = [];
+            while (s) {
+                s = s.nextElementSibling;
+                if (!s) return null;
+                if (s.getAttribute && (s.getAttribute('role') === 'tab' || s.tagName === 'BUTTON') && isVisible(s)) {
+                    if (tabIsExamLike(s)) { skipped0.push(cleanText((s.textContent || '')).slice(0, 12)); continue; }
+                    if (skipped0.length) logDebug('nav', '同小节内跳过单元测验/考试类标签：' + skipped0.join('、'));
+                    return s;
+                }
+            }
+            return null;
+        }
+        logDebug('nav', '内容条共 ' + tabs.length + ' 项，当前索引=' + idx);
+
+        var skipped = [];
+        for (var j = idx + 1; j < tabs.length; j++) {
+            var t = tabs[j];
+            if (tabIsExamLike(t)) { skipped.push(tabLabel(t).slice(0, 12)); continue; }
+            if (skipped.length) logDebug('nav', '同小节内跳过单元测验/考试类标签：' + skipped.join('、'));
+            if (tabIsQuiz(t)) logDebug('nav', '同小节下一个内容＝随堂测验「' + tabLabel(t).slice(0, 12) + '」，自动学习会作答并提交');
+            return t;
+        }
+        if (skipped.length) logDebug('nav', '同小节内跳过单元测验/考试类标签：' + skipped.join('、'));
+        return null;
+    }
+
+    // 标签列表里第一个可进入的内容标签（跨小节/章节后自动点它）
+    function firstTabInLesson(tabs) {
+        var list = (tabs && tabs.length) ? tabs : contentTabs();
+        for (var i = 0; i < list.length; i++) {
+            var t = list[i];
+            if (t && !tabIsExamLike(t)) return t;
+        }
+        return null;
+    }
+
+    // 等待内容标签栏完成切换。
+    // 判定标准从「出现不是旧激活元素的 tab」改成「激活项换了」：
+    // SPA 框架（React/Vue）会把 tablist 连同 tab 元素整批复用，只改激活 class。
+    // 老判据在这种情况下永远不成立 → 白等 10 秒 → 判跨小节失败。
+    async function waitForTablistRefresh(oldTab, oldKey) {
+        var t0 = Date.now();
+        while (Date.now() - t0 < 10000) {
+            if (taskState.cancelled) return null;
+            var cur = currentContentTab();
+            if (cur) {
+                var changedByNode = oldTab && cur !== oldTab;
+                var changedByKey = !!(oldKey && tabKey(cur) && tabKey(cur) !== oldKey);
+                var oldDetached = oldTab && !document.contains(oldTab);
+                if (changedByNode || changedByKey || oldDetached) {
+                    var tabs = contentTabs();
+                    logDebug('nav', 'tablist 已切换：新内容「' + tabLabel(cur).slice(0, 20) + '」，共 '
+                        + tabs.length + ' 个标签，等待耗时 ' + (Date.now() - t0) + 'ms');
+                    return tabs;
+                }
+            }
+            await sleep(200);
+        }
+        logDebug('nav', '⚠️ tablist 切换超时（10 秒内激活项未变化）');
+        return null;
+    }
+
+    // 展开「小节」下拉，返回下一个节点。
+    // 返回结构统一为 { ok, item, reason }：
+    //   ok=true            → item 是下一节（或下一节的分组标题）
+    //   reason='last'      → 确认当前就是本章最后一节
+    //   reason='unmatched' → 下拉里找不到当前小节（结构/文案变了）
+    //   reason='nodropdown'→ 没找到小节下拉按钮
+    // unmatched 和 last 必须分开：老代码两者都返回 null，于是「匹配失败」被当成
+    // 「本节已结束」直接跳章 —— 一整节的文档/测验/讨论就这样集体消失。
+    async function pickNextSectionItem() {
+        var dd = headerDropdowns();
+        if (!dd.section) { logDebug('nav', '⚠️ 未找到「小节」下拉按钮'); return { ok: false, item: null, reason: 'nodropdown' }; }
+        var name = dd.section.getAttribute('aria-label') || '';
+        logDebug('nav', '跨小节决策：小节名=「' + name.slice(0, 24) + '」');
+        var items = await findDropdownItems(dd.section);
+        var next = nextOfMenuItems(items, name);
+        if (!next) {
+            var unmatched = lastMenuMatch.idx === -1;
+            if (dd.section.getAttribute('aria-expanded') === 'true') realClick(dd.section);
+            if (unmatched) {
+                logDebug('nav', '⚠️ 小节下拉里定位不到当前小节 → 不做跨章节判断，避免漏掉整节');
+                return { ok: false, item: null, reason: 'unmatched' };
+            }
+            logDebug('nav', '小节下拉无下一项 → 判定当前小节是本章最后一项，进入跨章节');
+            return { ok: false, item: null, reason: 'last' };
+        }
+        logDebug('nav', '跨小节目标=「' + itemFullText(next).slice(0, 24) + '」');
+        return { ok: true, item: next, reason: 'ok' };
+    }
+
+    // 展开「章节」下拉，返回下一个章节节点（无下一项＝全部学完）
+    async function pickNextChapterItem() {
+        var dd = headerDropdowns();
+        if (!dd.chapter) { logDebug('nav', '⚠️ 未找到「章节」下拉按钮'); return { ok: false, item: null, reason: 'nodropdown' }; }
+        var name = dd.chapter.getAttribute('aria-label') || '';
+        logDebug('nav', '跨章节决策：章节名=「' + name.slice(0, 24) + '」');
+        var items = await findDropdownItems(dd.chapter);
+        var next = nextOfMenuItems(items, name);
+        if (!next) {
+            var unmatched = lastMenuMatch.idx === -1;
+            if (dd.chapter.getAttribute('aria-expanded') === 'true') realClick(dd.chapter);
+            if (unmatched) {
+                logDebug('nav', '⚠️ 章节下拉里定位不到当前章节 → 不判定“全部学完”');
+                return { ok: false, item: null, reason: 'unmatched' };
+            }
+            logDebug('nav', '章节下拉无下一项 → 判定全部章节学完');
+            return { ok: false, item: null, reason: 'last' };
+        }
+        logDebug('nav', '跨章节目标=「' + itemFullText(next).slice(0, 24) + '」');
+        return { ok: true, item: next, reason: 'ok' };
+    }
+
+    // 跨小节点击后激活项没变：说明点的是「分组标题」这类只定位不加载的节点。
+    // 改为点该节下面第一个真正的内容单元（文档/视频/测验/讨论）。
+    async function clickFirstContentAfterSection(sectionLabel, oldTab, oldKey) {
+        var dd = headerDropdowns();
+        if (!dd.section) return null;
+        var items = await findDropdownItems(dd.section);
+        // 注意：这里重新取到的 items 是新节点，不能拿旧 item 去 indexOf
+        //（老代码正是这么写的，结果恒为 -1，兜底逻辑从来没生效过）。
+        // 改用文案 / 编号重新定位当前节。
+        var target = normMatch(sectionLabel);
+        var code = codeKeyOf(sectionLabel);
+        var idx = -1, i;
+        for (i = 0; i < items.length; i++) {
+            var k = normMatch(itemFullText(items[i]));
+            if (k && target && (k === target || k.indexOf(target) !== -1 || target.indexOf(k) !== -1)) { idx = i; break; }
+        }
+        if (idx === -1 && code) {
+            for (i = 0; i < items.length; i++) if (codeKeyOf(itemFullText(items[i])) === code) { idx = i; break; }
+        }
+        if (idx === -1) {
+            logDebug('nav', '⚠️ 兜底也定位不到「' + String(sectionLabel).slice(0, 20) + '」，放弃本次跨小节');
+            return null;
+        }
+        for (var j = idx + 1; j < items.length; j++) {
+            var ft = itemFullText(items[j]);
+            if (ft && !isGroupTitle(ft)) {
+                logDebug('nav', '改点该节第一个内容单元=「' + ft.slice(0, 20) + '」');
+                clickMenuItem(items[j]);
+                return await waitForTablistRefresh(oldTab, oldKey);
+            }
+        }
+        return null;
+    }
+
+    // 进入新小节/新章节的第一个内容标签（随堂测验也进），并登记「我应该在哪个内容上」
+    async function enterFirstTab(tabs) {
+        var first = firstTabInLesson(tabs);
+        if (!first) {
+            // 整节都是单元测验/作业/考试类标签（没有可学内容）：仍进第一个，
+            // 否则学习会停在这里不动。learnOne 里对这类页面零点击、只短暂停留。
+            first = (tabs && tabs[0]) || null;
+            if (first) logDebug('nav', '⚠️ 本节内容全是单元测验/作业/考试类标签，仍进入第一个以免卡住');
+        }
+        if (!first) return false;
+        var key = tabKey(first);
+        learnSetExpect(key, contentKindFromTab(first));
+        realClick(first);
+        if (!await waitForTabActive(first, 4000)) {
+            // 节点可能刚被框架替换过：按文案重新取一次再点
+            var fresher = findTabByKey(key);
+            if (fresher && fresher !== first) {
+                realClick(fresher);
+                if (await waitForTabActive(fresher, 4000)) {
+                    logDebug('nav', '已进入新小节第一个内容：「' + key.slice(0, 20) + '」');
+                    return true;
+                }
+            }
+            logDebug('nav', '⚠️ 已点击新小节第一个内容，但激活态未确认（仍按该内容继续处理）');
+        }
+        return true;
+    }
+
+    // 执行跨小节：点击小节选项 → 等激活项切换 → 点第一个内容标签（随堂测验也进）
+    // 兜底：点击的是分组标题（第一节/第二节）且平台不响应（激活项未变）时，
+    // 自动改点该分组标题后面的第一个内容单元，保证不会卡在“节标题被跳过/无反应”。
+    async function doSectionJump(item) {
+        var oldTab = currentContentTab();
+        var oldKey = oldTab ? tabKey(oldTab) : '';
+        var itemLabel = itemFullText(item);
+        clickMenuItem(item);
+        updateStatus('📚 跨小节：进入下一节，自动播放第一个内容...');
+        var tabs = await waitForTablistRefresh(oldTab, oldKey);
+        if (!tabs || tabs.length === 0) {
+            logDebug('nav', '⚠️ 点击「' + itemLabel.slice(0, 20) + '」后激活项未切换，改点该节第一个内容单元');
+            tabs = await clickFirstContentAfterSection(itemLabel, oldTab, oldKey);
+        }
+        if (!tabs || tabs.length === 0) return false;
+        return await enterFirstTab(tabs);
+    }
+
+    // 执行跨章节：点击章节选项 → 等激活项切换（必要时先点第一个小节）→ 点第一个内容标签
+    async function doChapterJump(item) {
+        var oldTab = currentContentTab();
+        var oldKey = oldTab ? tabKey(oldTab) : '';
+        var itemLabel = itemFullText(item);
+        clickMenuItem(item);
+        updateStatus('📕 跨章节：进入下一章，自动播放第一个内容...');
+        var tabs = await waitForTablistRefresh(oldTab, oldKey);
+        if (!tabs || tabs.length === 0) {
+            // 若平台未自动选中第一小节，展开小节下拉点第一项（同样按重新取到的节点点）
+            var dd2 = headerDropdowns();
+            if (dd2.section) {
+                var items2 = await findDropdownItems(dd2.section);
+                if (items2.length > 0) {
+                    logDebug('nav', '跨章节后未自动进入小节，改点小节下拉第一项=「' + itemFullText(items2[0]).slice(0, 20) + '」');
+                    clickMenuItem(items2[0]);
+                    await sleep(600);
+                }
+            }
+            if (!tabs || tabs.length === 0) tabs = await waitForTablistRefresh(oldTab, oldKey);
+        }
+        if (!tabs || tabs.length === 0) {
+            logDebug('nav', '⚠️ 跨章节点击「' + itemLabel.slice(0, 20) + '」后内容条未切换');
+            return false;
+        }
+        return await enterFirstTab(tabs);
+    }
+
+    // 主跳转入口（严格三级优先级：同小节 → 跨小节 → 跨章节 → 结束）
+    // 关键修复：跨小节必须先确认「小节下拉里确实有下一项」才执行；
+    // 只有确认当前小节是最后一项，才会进入跨章节——从根上杜绝“节没学完就跳章”。
+    async function goNext() {
+        // SPOC：内容是 .unitslist 的一条条 .f-fl，章节/小节是 .up.j-up 下拉，
+        // 与 MOOC 的 tablist 完全两套。先走 SPOC；它认不出结构时返回 null 再兜底。
+        if (isSpocCourse()) {
+            var spocResult = await spocGoNext();
+            if (spocResult === true) {
+                // SPOC 的「当前项」是 .current 而不是内容条标签，这里不做预期锚定，
+                // 否则等待期会被“预期内容对不上”的兜底反复触发。
+                learnSetExpect('', '');
+                return true;
+            }
+            if (spocResult === false) {
+                logDebug('nav', '🏁 SPOC：全部章节学完 → 课程学习完成');
+                alert('课程学习完成！');
+                return false;
+            }
+            logDebug('nav', 'SPOC：跳转结构未识别，退回通用 tablist 逻辑');
+        }
+
+        // 当前激活的内容标签（页面加载慢时等它出现）
+        var curTab = currentContentTab();
+        if (!curTab) {
+            logDebug('nav', '当前激活 tab 未找到，等待出现...');
+            var wt0 = Date.now();
+            while (Date.now() - wt0 < 5000 && !taskState.cancelled) {
+                await sleep(200);
+                curTab = currentContentTab();
+                if (curTab) break;
+            }
+            if (!curTab) { logDebug('nav', '❌ 5 秒后仍无激活 tab'); updateStatus('❌ 未找到当前内容标签，无法跳转'); return false; }
+        }
+        var curKey = tabKey(curTab);
+        logDebug('nav', 'goNext 入口：当前激活 tab=「' + tabLabel(curTab).slice(0, 20) + '」');
+
+        // 跳转前先校准位置：处理内容的这段时间里，平台可能又把页面带走了
+        //（已看完视频的“自动播放下一集”）。若当前位置和预期不符、而预期内容
+        // 还在内容条里，先切回去再算“下一个”——否则会从被带走的位置继续，
+        // 中间那些文档/测验/讨论就成了永久漏项。
+        var stNow = learnLoadState();
+        var expectNow = (stNow && stNow.expectKey) || '';
+        if (expectNow && curKey && !sameTabKey(curKey, expectNow)) {
+            var backTab = findTabByKey(expectNow);
+            if (backTab) {
+                logDebug('nav', '⚠️ 跳转前校准：当前「' + curKey.slice(0, 20) + '」≠ 预期「'
+                    + expectNow.slice(0, 20) + '」，先切回预期内容');
+                realClick(backTab);
+                if (await waitForTabActive(backTab, 3000)) {
+                    curTab = backTab;
+                    curKey = tabKey(curTab);
+                    updateStatus('↩️ 页面被平台自动切走，已切回原内容继续按顺序前进...');
+                } else {
+                    logDebug('nav', '⚠️ 校准切回未生效，按当前位置继续');
+                }
+            }
+        }
+        // 优先级 1：同小节内 —— 按内容条索引取下一个（随堂测验也进）
+        var target = nextTabInLesson(curTab);
+        if (target) {
+            var targetKey = tabKey(target);
+            if (targetKey && targetKey === curKey) {
+                logDebug('nav', '⚠️ 下一个内容与当前内容同名（' + targetKey + '），跳过同小节跳转，避免原地打转');
+                target = null;
+            }
+        }
+        if (target) {
+            learnSetExpect(tabKey(target), contentKindFromTab(target));
+            realClick(target);
+            updateStatus('➡️ 同小节：进入下一个内容');
+            logDebug('nav', '优先级1 同小节：点击「' + tabLabel(target).slice(0, 20) + '」');
+            var activated = await waitForTabActive(target);
+            if (!activated) {
+                // 点一次没反应（元素刚被框架替换、或被浮层挡住）：补一次再确认
+                var again = findTabByKey(tabKey(target)) || target;
+                logDebug('nav', '⚠️ 首次点击后激活态未确认，补点一次');
+                realClick(again);
+                activated = await waitForTabActive(again, 3000);
+            }
+            if (activated) return true;
+            logDebug('nav', '⚠️ 同小节标签两次点击均未激活，退回跨小节判断');
+            updateStatus('⚠️ 同小节切换未生效，改走跨小节...');
+        } else {
+            logDebug('nav', '优先级1 无下一个同小节 tab（已到本节末尾）');
+        }
+        // 优先级 2：跨小节 —— 先确认小节下拉里确有下一项
+        var secRes = await pickNextSectionItem();
+        if (secRes.ok) {
+            if (await doSectionJump(secRes.item)) return true;
+            // 跨小节执行失败（点击了但内容未加载）：重试一次，绝不误跳章节
+            updateStatus('⚠️ 跨小节执行失败，10 秒后自动重试...');
+            logDebug('nav', '⚠️ 跨小节失败，10 秒后重试');
+            await sleepWhile(10000, function () { return manualWaitFlag; });
+            secRes = await pickNextSectionItem();
+            if (secRes.ok && await doSectionJump(secRes.item)) return true;
+            logDebug('nav', '⚠️ 跨小节连续失败');
+            updateStatus('⚠️ 跨小节连续失败：请手动点击「小节」下拉切换，或检查顶部按钮结构');
+            return false;
+        }
+        if (secRes.reason === 'unmatched') {
+            // 定位不到当前小节时绝不能跳章：那样会把这一整节剩下的内容全漏掉
+            updateStatus('⚠️ 小节下拉里定位不到当前小节，已停止（不再跳章以免漏学整节）。可手动切换一节后重新开始');
+            return false;
+        }
+        // 优先级 3：跨章节 —— 已确认当前小节是本章最后一项
+        var chapRes = await pickNextChapterItem();
+        if (chapRes.ok) {
+            if (await doChapterJump(chapRes.item)) return true;
+            logDebug('nav', '⚠️ 跨章节执行失败');
+            updateStatus('⚠️ 跨章节执行失败：请手动点击「章节」下拉切换，或检查顶部按钮结构');
+            return false;
+        }
+        if (chapRes.reason === 'unmatched' || chapRes.reason === 'nodropdown' || secRes.reason === 'nodropdown') {
+            // 结构没识别出来 ≠ 学完了：宁可停下提示，也不要谎报“课程学习完成”
+            updateStatus('⚠️ 顶部导航结构没识别出来，已停止跳转（详见日志 menu/nav 分类）');
+            return false;
+        }
+        // 结束状态：所有查找都返回 null
+        logDebug('nav', '🏁 三级跳转全部无目标 → 课程学习完成');
+        alert('课程学习完成！');
+        return false;
+    }
+
+    // 富文本/节标题页等正文是否已经渲染出来（避免内容还没加载完就跳走）
+    function hasVisibleContentBody() {
+        var sels = [
+            'main p', 'main h1', 'main h2', 'main h3', 'main h4',
+            '[class*="content"] p', '[class*="content"] h1', '[class*="content"] h2', '[class*="content"] h3',
+            '[class*="lesson"] p', '[class*="learn-content"] p', '[class*="rich-text"] p',
+            '[class*="section-title"]', '[class*="chapter-title"]', '[class*="lesson-title"]',
+            '[class*="learn-section"]', '[class*="learn-lesson-title"]',
+        ];
+        var hits = collectCandidates(document, sels, 80);
+        for (var i = 0; i < hits.length; i++) {
+            var el = hits[i];
+            if (!isVisible(el)) continue;
+            var t = cleanText((el.textContent || '')).slice(0, 80);
+            if (!t || t.length < 2) continue;
+            // 排除脚本面板/导航等 UI 外壳文本与加载占位
+            if (/MOOC 助手|自动学习|停止当前操作|页面 DOM 诊断|开始自动学习|加载中|loading|努力加载/.test(t)) continue;
+            var r = el.getBoundingClientRect ? el.getBoundingClientRect() : null;
+            if (r && (r.width < 60 || r.height < 20)) continue;
+            return true;
+        }
+        return false;
+    }
+
+    // 等待当前内容真正加载出来（SPA 异步渲染）。
+    // 视频/文档/讨论/富文本正文任一出现即算就绪；超时仍未出现 → 返回 false（按加载失败处理）。
+    async function waitContentReady(timeout) {
+        var t0 = Date.now();
+        // 按「当前标签声明的类型」等对应元素，而不是等「页面上随便冒出什么」。
+        // 切到「测试」标签时，上一个文档的查看器往往还挂在页面上，
+        // 用通用判定会 1ms 就绪、然后被当成文档处理掉。
+        var kind = contentKindFromTab(currentContentTab());
+        if (kind) logDebug('load', '按当前内容标签类型等待：' + kind);
+        while (Date.now() - t0 < timeout) {
+            if (taskState.cancelled) return false;
+            if (kind === 'quiz') {
+                if (hasVisibleQuestionBlocks() || lqScope()) { logDebug('load', '内容就绪：题目块（' + (Date.now() - t0) + 'ms）'); return true; }
+                await sleep(500);
+                continue;
+            }
+            if (kind === 'video') {
+                if (findVideo()) { logDebug('load', '内容就绪：video（' + (Date.now() - t0) + 'ms）'); return true; }
+                await sleep(500);
+                continue;
+            }
+            if (kind === 'doc') {
+                if (findDocViewer()) { logDebug('load', '内容就绪：文档查看器（' + (Date.now() - t0) + 'ms）'); return true; }
+                await sleep(500);
+                continue;
+            }
+            // 标签没给出类型（老版页面 / SPOC）：沿用原来的「任一元素出现即就绪」
+            if (findVideo()) { logDebug('load', '内容就绪：video（' + (Date.now() - t0) + 'ms）'); return true; }
+            if (findDocViewer()) { logDebug('load', '内容就绪：文档查看器（' + (Date.now() - t0) + 'ms）'); return true; }
+            if (looksLikeDiscussionPage()) { logDebug('load', '内容就绪：讨论页（' + (Date.now() - t0) + 'ms）'); return true; }
+            // 随堂测验页没有视频/文档/正文，只有题块。不认它就会“等 15 秒判加载失败”
+            if (hasVisibleQuestionBlocks() || lqScope()) { logDebug('load', '内容就绪：题目块（' + (Date.now() - t0) + 'ms）'); return true; }
+            if (hasVisibleContentBody()) { logDebug('load', '内容就绪：富文本/标题页正文（' + (Date.now() - t0) + 'ms）'); return true; }
+            await sleep(500);
+        }
+        logDebug('load', '⚠️ 内容加载超时（' + timeout + 'ms 内未见任何正文）' + (kind ? '（标签类型=' + kind + '）' : ''));
+        return false;
+    }
+
+    // —— 自动学习主流程 ——
+
+    // 当前这个视频是不是「此前就已经看完」的。
+    // 注意排除「上一段视频的 DOM 还没被换掉」这种情况：那种节点也停在结尾，
+    // 但它属于上一个内容，拿它判断会把刚切过来的新视频误判成已完成而跳过。
+    var learnLastVideoEl = null;
+
+    function isCurrentVideoAlreadyDone() {
+        var v = findVideo();
+        if (v && v === learnLastVideoEl) return false;   // 还是上一段视频的节点，不作数
+        if (v && videoWatchedOut(v)) return true;
+        return tabLooksDone(currentContentTab());
+    }
+
+    // 处理当前内容（视频/文档/测验/讨论），然后自动进入下一个内容
+    async function learnOne() {
+        var st = learnLoadState();
+        if (!st) { setFloatVisible(false); return; }
+        // 上一轮跳转完成，清掉「用户点了【下一节】」的标志，避免误跳过本轮内容
+        manualWaitFlag = false;
+        await sleep(500);
+        await dismissModal();
+        // 跳转后强制停留满 10 秒（含整页刷新后的续跑）。
+        // 不等的话，页面上残留的上一份 DOM 会让类型判定出错，直接跳到下一节。
+        await waitJumpSettle();
+        // 等当前内容真正加载出来（修复：文档/课件还没渲染完就跳转）
+        updateStatus('⏳ 等待内容加载...');
+        var ready = await waitContentReady(CONFIG.LEARN_CONTENT_READY_WAIT);
+        if (taskState.cancelled) { learnClearState(); setFloatVisible(false); return; }
+        var type;
+        if (!ready) {
+            // 内容迟迟没渲染：若内容标签明确说了类型，就按该类型继续，
+            // 让下游（如随堂测验的等待窗口）再争取一次，而不是直接判「加载失败」跳过。
+            var lateKind = contentKindFromTab(currentContentTab());
+            if (lateKind) {
+                var kindName = { quiz: '测验', video: '视频', doc: '文档', discussion: '讨论' }[lateKind] || lateKind;
+                logDebug('load', '内容就绪超时，但当前标签类型=' + lateKind + '，按该类型继续');
+                // 白页多半是「标签切了、内容区没回填」。先催一次重载，
+                // 别默默按超时跳过——这是「自动学习跳过不完成」的另一半来源。
+                if (lateKind !== 'quiz' && await nudgeCurrentContent(lateKind)) {
+                    logDebug('load', '重新加载后内容已就绪（' + lateKind + '）');
+                    ready = true;
+                } else {
+                    updateStatus('⚠️ 内容渲染较慢，按标签类型（' + kindName + '）继续尝试...');
+                }
+            }
+            if (ready) {
+                type = detectContentType();
+            } else if (lateKind) {
+                type = lateKind;
+            } else {
+                updateStatus('⚠️ 内容加载超时（15 秒未渲染出来），按加载失败跳过...');
+                type = 'missing';
+            }
+        } else {
+            type = detectContentType();
+        }
+        var done = true;
+
+        if (type === 'missing') {
+            // 课件加载失败（unitId/lessonId 不匹配等）→ 快速跳过
+            logDebug('learn', 'missing：跳过，进入下一个内容');
+            updateStatus('⚠️ 内容加载失败，尝试进入下一个内容...');
+            done = true;
+        } else if (type === 'video' && isCurrentVideoAlreadyDone()) {
+            // 落点是此前已看完的视频：不重播。
+            // 重播会把 currentTime 拉回 0（白耗一整集），而且这期间平台的
+            // “自动播放下一集”会抢跑，把后面的文档/测验/讨论整段带过去。
+            logDebug('learn', 'video：该视频此前已看完，不重播，直接进入下一个内容');
+            updateStatus('⏭ 该视频此前已看完，跳过重播，进入下一个内容...');
+            done = true;
+        } else if (type === 'video' && CONFIG.LEARN_SKIP_CONSECUTIVE_VIDEO && st.lastType === 'video') {
+            // 老行为（默认已关）：视频→视频 直接跳过第二个。
+            // 但这条会让人成片漏学，默认不再开；需要时把配置改成 true。
+            logDebug('learn', '连续视频：按配置跳过（LEARN_SKIP_CONSECUTIVE_VIDEO=true）');
+            updateStatus('⏭ 跳过连续视频（配置为不视频接视频），进入下一个内容...');
+            done = true;
+        } else if (type === 'video') {
+            done = await learnVideoItem();
+        } else if (type === 'doc') {
+            done = await learnDocItem();
+        } else if (type === 'quiz') {
+            // 随堂测验（小节内容条里那个「测试」标签，MOOC / SPOC 都有）：
+            // 自动作答并提交，提交后停留 10 秒再进下一个内容。
+            // 单元测验/作业/考试是独立页——isLessonQuizPage() 会判掉，绝不动手。
+            //
+            // 注意：刚切到「测试」标签时容器往往还是空的，这时直接判会得出
+            // 「非随堂测验」而跳过。手动点按钮时页面早已加载完，所以复现不出来。
+            // 先给一段等待窗口，让题块渲染出来再判。
+            var quizReady = false;
+            if (CONFIG.LEARN_AUTO_QUIZ) {
+                quizReady = await waitLessonQuizReady(CONFIG.LEARN_QUIZ_READY_WAIT);
+                // 标签说是测验、页面却一块题都没有：这不是「单元测验」，多半是没渲染出来
+                //（或停在已提交的结果态）。干等只会白等，交给自救流程再争取两次。
+                if (!quizReady && contentKindFromTab(currentContentTab()) === 'quiz') {
+                    logDebug('learn', 'quiz：题块未出现，启动自救（重做/重渲染/切走再切回）');
+                    quizReady = await retryQuizRender(2);
+                }
+            } else {
+                logDebug('learn', 'quiz：LEARN_AUTO_QUIZ 已关闭，不作答');
+            }
+            if (quizReady) {
+                logDebug('learn', 'quiz：随堂测验，自动作答并提交');
+                updateStatus('📝 随堂测验：自动作答并提交...');
+                var qr = await completeLessonQuiz();
+                var waitMs = CONFIG.LEARN_QUIZ_AFTER_MS;
+                if (qr && qr.submitted) {
+                    logDebug('learn', 'quiz：已提交' + (qr.filled ? '（' + qr.filled + ' 题）' : '') + '，停留 ' + waitMs + 'ms 再跳转');
+                    updateStatus('✅ 随堂测验已提交' + (qr.filled ? '（' + qr.filled + ' 题）' : '')
+                        + '，停留 ' + Math.round(waitMs / 1000) + ' 秒后进入下一个内容（可点右下角【下一节】提前跳）...');
+                } else {
+                    logDebug('learn', 'quiz：未自动提交（' + lqResultText(qr) + '），仍停留 ' + waitMs + 'ms 后跳转');
+                    updateStatus('⚠️ 随堂测验未自动提交（' + lqResultText(qr) + '），停留 '
+                        + Math.round(waitMs / 1000) + ' 秒后进入下一个内容（可点右下角【下一节】提前跳）...');
+                }
+                await sleepWhile(waitMs, function () { return manualWaitFlag; });
+                done = true;
+            } else {
+                // 单元测验/作业/考试，或用户关掉了 LEARN_AUTO_QUIZ：只短暂停留，不作答
+                if (!CONFIG.LEARN_AUTO_QUIZ) {
+                    logDebug('learn', 'quiz：CONFIG.LEARN_AUTO_QUIZ=false，按配置不作答');
+                    updateStatus('⏭ 已关闭随堂测验自动作答，直接进入下一个内容...');
+                } else {
+                    logDebug('learn', 'quiz：等待 + 自救都没拿到题块（' + quizGiveUpDigest() + '），不作答，跳过');
+                    updateStatus('⏭ 测验页没渲染出题目：不作答，直接进入下一个内容（日志有现场摘要）');
+                }
+                await sleep(CONFIG.LEARN_QUIZ_VISIT_MS);
+                done = true;
+            }
+        } else if (type === 'discussion') {
+            done = await learnDiscussionItem();
+        } else {
+            // 富文本等其它内容：停留 10 秒后自动跳转（可随时点右下角【下一节】提前跳）
+            logDebug('learn', 'other：富文本/标题页，停留 ' + CONFIG.LEARN_OTHER_VISIT_MS + 'ms 后跳转');
+            updateStatus('📄 富文本内容：停留 10 秒后自动跳转（可点右下角【下一节】提前跳）...');
+            await sleepWhile(CONFIG.LEARN_OTHER_VISIT_MS, function () { return manualWaitFlag; });
+            done = true;
+        }
+        if (taskState.cancelled || !done) {
+            if (taskState.cancelled) updateStatus('⏹ 已停止当前操作');
+            learnClearState();
+            setFloatVisible(false);
+            return;
+        }
+
+        // 记录上一个内容的类型（用于连续视频跳过）
+        st.lastType = type;
+        learnSaveState(st);
+
+        // 所有类型统一自动进入下一个内容
+        var ok = await goNext();
+        if (!ok) { learnClearState(); setFloatVisible(false); return; }
+        // 记下跳转时刻：下一轮 learnOne 开始前会强制等满 10 秒
+        learnMarkJump();
+        await learnOne();
+    }
+
+    // 用户点击「开始自动学习」：从当前内容开始处理，不跳转
+    async function learnChapter() {
+        if (!/\/learn\//.test(location.pathname) && !/\/spoc\/learn\//.test(location.pathname)) {
+            updateStatus('⚠️ 自动学习只在新版学习页可用（请先进入课程学习页的某个内容）');
+            return;
+        }
+        // 关掉平台自带的“自动播放下一集”，避免和我们自己的跳转抢节奏
+        // （这也是「已看完的视频 5 秒后自己跳到下一集、把中间内容带过去」的元凶）
+        if (turnOffPlatformAutoNext()) updateStatus('已关闭平台自带的“自动播放下一集”');
+
+        learnSaveState({
+            running: true,
+            course: location.pathname.replace(/\/content\/\d+.*$/, '') || location.pathname,
+            lastType: null,
+            expectKey: '',
+            expectKind: ''
+        });
+        // 手动重新开始：不受上一轮跳转留下的等待影响
+        lastJumpAt = 0;
+        learnLastVideoEl = null;
+        setFloatVisible(true);
+        logDebug('learn', '🚀 手动开始自动学习，课程=' + location.pathname.slice(0, 60));
+        updateStatus('🚀 自动学习开始：从当前内容处理，视频看完自动进入下一个内容...');
+        await learnOne();
+    }
+
+    // 页面初始化时调用：若 localStorage 里还有未完成的自动学习且课程没变，接着跑
+    function resumeLearn() {
+        var st = learnLoadState();
+        if (!st) return;
+        if (st.course && location.pathname.indexOf(st.course) !== 0) { learnClearState(); return; }
+        taskState.running = true;
+        taskState.cancelled = false;
+        setButtonsRunning(true);
+        setFloatVisible(true);
+        logDebug('learn', '▶ 页面刷新，自动学习已恢复（lastType=' + (st.lastType || 'null') + '）');
+        updateStatus('▶ 自动学习已恢复...');
+        Promise.resolve().then(learnOne).catch(function (err) {
+            if (err && err.__cancelled) updateStatus('⏹ 已停止当前操作');
+            else { logDebug('err', '自动学习异常：' + (err && err.message)); console.error('[auto-learn]', err); updateStatus('❌ 自动学习异常：' + (err && err.message)); }
+        }).then(function () {
+            // 只有学习真正结束/被停止时才收尾；等待【下一节】时状态仍在，不收尾
+            if (!learnLoadState()) {
+                taskState.running = false;
+                taskState.cancelled = false;
+                setButtonsRunning(false);
+                setFloatVisible(false);
+            }
+        });
+    }
+
+    // —— 悬浮【下一节】按钮 ——
+    // 用途：① 富文本内容停留期间，点它提前结束等待并进入下一个内容；
+    //       ② 视频播放中/文档翻页中，点它立即跳过当前内容。
+    // 机制：点击只置 manualWaitFlag 标志，当前内容处理循环检测到标志会提前结束，
+    //       然后由 learnOne 统一走 goNext —— 避免按钮直接跳转造成双重跳转。
+    var manualWaitFlag = false;
+
+    function createFloatNextBtn() {
+        if (document.getElementById('mar-float-next')) return;
+        var btn = document.createElement('button');
+        btn.id = 'mar-float-next';
+        btn.textContent = '下一节';
+        btn.title = '立即进入下一个内容（视频/文档/富文本都适用）';
+        btn.style.cssText = 'position:fixed;right:24px;bottom:24px;z-index:999999;padding:10px 20px;font-size:14px;color:#fff;background:#e86e4f;border:none;border-radius:20px;cursor:pointer;box-shadow:0 2px 12px rgba(0,0,0,.3);display:none;';
+        btn.addEventListener('click', function () {
+            if (!taskState.running) return;
+            manualWaitFlag = true;
+            updateStatus('⏩ 已请求进入下一个内容...');
+        });
+        document.body.appendChild(btn);
+    }
+
+    function setFloatVisible(v) {
+        var b = document.getElementById('mar-float-next');
+        if (b) b.style.display = v ? 'block' : 'none';
+    }
+
+    // ===================== 页面 DOM 诊断 =====================
+    // 新版 UI 如果改了讨论区类名，点这个按钮会把当前页面的候选结构导出来，
+    // 复制给作者即可精准适配；不会改动页面任何东西。
+    function probeDiscussionDom() {
+        var lines = [];
+        lines.push('URL: ' + location.href);
+        lines.push('Hash: ' + location.hash);
+        lines.push('课程类型: ' + courseUiLabel() + '（' + detectCourseUi() + '）');
+        lines.push('Title: ' + cleanText(document.title).slice(0, 100));
+        lines.push('');
+        var groups = {
+            '回复列表容器(listSelectors)': DISCUSS.listSelectors,
+            '楼层(itemSelectors)': DISCUSS.itemSelectors,
+            '正文(contentSelectors)': DISCUSS.contentSelectors,
+            '编辑器作用域(editorScope)': DISCUSS.editorScopeSelectors,
+        };
+        var i, key;
+        for (key in groups) {
+            var hits = collectCandidates(document, groups[key], 40);
+            var vis = 0;
+            for (i = 0; i < hits.length; i++) if (isVisible(hits[i])) vis++;
+            lines.push(key + '：命中 ' + hits.length + '（可见 ' + vis + '）');
+        }
+        lines.push('');
+        // 【讨论正文解析实测】——排查「回复出去的是别人的昵称」就看这一段：
+        // 逐条列出整层原文、识别到的作者、剥完元信息后真正会发出去的正文，
+        // 一眼能分清是「根本没取到正文」还是「取到了但没剥干净」。
+        lines.push('【讨论正文解析实测】');
+        var parsedDbg = parseReplyItems();
+        var dbgListCls = '';
+        if (parsedDbg.listEl) {
+            dbgListCls = typeof parsedDbg.listEl.className === 'string'
+                ? parsedDbg.listEl.className
+                : ((parsedDbg.listEl.getAttribute && parsedDbg.listEl.getAttribute('class')) || '');
+        }
+        lines.push('解析到楼层：' + parsedDbg.items.length + ' 条'
+            + (parsedDbg.viaList ? '（命中容器 class="' + dbgListCls.slice(0, 70) + '"）' : '（未命中已知容器，整页兜底）'));
+        var pdi;
+        for (pdi = 0; pdi < parsedDbg.items.length && pdi < 6; pdi++) {
+            var pdiItem = parsedDbg.items[pdi];
+            lines.push('  #' + (pdi + 1)
+                + ' 作者=「' + (pdiItem.author || '未识别') + '」'
+                + ' 点赞=' + (pdiItem.likes === null ? '未解析' : pdiItem.likes)
+                + ' 时间=' + (pdiItem.timeText || '未解析'));
+            lines.push('     整层原文：' + cleanText(pdiItem.el.textContent).slice(0, 120));
+            lines.push('     取用正文：' + pdiItem.text.slice(0, 120)
+                + '（' + (pdiItem.viaContent ? '命中正文节点' : '整层兜底') + '）');
+        }
+        if (parsedDbg.items.length === 0) lines.push('  （一条都没解析到）');
+        var dbgChosen = resolveReplyContent();
+        lines.push('  → 最终会发出去：' + (dbgChosen.ok ? dbgChosen.text.slice(0, 120) : '【不可用】' + dbgChosen.error));
+        lines.push('');
+
+        var dumpSels = {
+            '回复/评论容器': '[class*="reply"], [class*="comment"], [class*="discuss"], [class*="post"], [class*="floor"]',
+            '编辑器': 'textarea, [contenteditable], [class*="editor"], [class*="Editor"]',
+            '点赞/投票': '[class*="vote"], [class*="like"], [class*="zan"], [class*="praise"], [class*="thumb"]',
+            '按钮(回复/发表/发布/提交/发送)': 'button, a, [role="button"], input[type="submit"]',
+            '单选项': 'input[type="radio"], input[type="checkbox"]',
+        };
+        var k2;
+        for (k2 in dumpSels) {
+            var els;
+            try { els = document.querySelectorAll(dumpSels[k2]); } catch (e) { continue; }
+            var shown = 0;
+            for (i = 0; i < els.length && shown < 14; i++) {
+                var el = els[i];
+                if (!isVisible(el)) continue;
+                if (k2.indexOf('按钮') !== -1) {
+                    var tt = cleanText(el.textContent || el.value || '').slice(0, 6);
+                    if (!/回复|发表|发布|提交|发送/.test(tt)) continue;
+                }
+                if (k2.indexOf('单选项') !== -1) {
+                    var lbl = el.closest ? el.closest('label') : null;
+                    var ltxt = lbl ? cleanText(lbl.textContent).slice(0, 24) : '';
+                    lines.push('  [radio] ' + ltxt);
+                    shown++;
+                    continue;
+                }
+                var cls = typeof el.className === 'string' ? el.className : (el.getAttribute ? (el.getAttribute('class') || '') : '');
+                var txt = cleanText(el.textContent || '').slice(0, 40);
+                var idattr = el.id ? ' id="' + el.id + '"' : '';
+                var extra = (el.disabled ? ' [disabled]' : '') + (el.readOnly ? ' [readonly]' : '');
+                lines.push('  <' + String(el.tagName || '').toLowerCase() + ' class="' + cls.slice(0, 90) + '"' + idattr + extra + '> ' + txt);
+                shown++;
+            }
+            if (shown > 0) { lines.push('（' + k2 + ' 可见候选 ' + shown + ' 条）'); lines.push(''); }
+        }
+
+        // 【随堂测验题块实测】——「选择题匹配不上」先看这一段：
+        // 题块认出来几个、每题的题干和选项文案长什么样，再对照下面的答案源。
+        lines.push('【随堂测验题块实测】');
+        var dbgScope = lqScope();
+        var dbgBlocks = lqBlocks(dbgScope);
+        var dbgScopeCls = dbgScope
+            ? (typeof dbgScope.className === 'string' ? dbgScope.className : (dbgScope.getAttribute('class') || ''))
+            : '';
+        lines.push('题块容器：' + (dbgScope ? '命中 class="' + dbgScopeCls.slice(0, 80) + '"' : '未命中（整页兜底）')
+            + '，题块 ' + dbgBlocks.length + ' 个');
+        for (var bi = 0; bi < dbgBlocks.length && bi < 10; bi++) {
+            var bopts = lqOptions(dbgBlocks[bi]);
+            var bnames = [];
+            for (var bo = 0; bo < bopts.length; bo++) {
+                bnames.push(cleanText(bopts[bo].text).slice(0, 16) || '(空)');
+            }
+            var bcls = typeof dbgBlocks[bi].className === 'string'
+                ? dbgBlocks[bi].className : (dbgBlocks[bi].getAttribute('class') || '');
+            lines.push('  题' + (bi + 1) + ' <' + String(dbgBlocks[bi].tagName || '').toLowerCase()
+                + ' class="' + bcls.slice(0, 80) + '">');
+            lines.push('     题干：' + lqBlockText(dbgBlocks[bi]).slice(0, 90));
+            lines.push('     选项×' + bopts.length + '：' + bnames.join(' / '));
+        }
+        if (dbgBlocks.length > 0) {
+            // 附一段题块原始 HTML：类名千变万化，看文案容易误判，看结构最准
+            var dbgHtml = String(dbgBlocks[0].outerHTML || '').replace(/\s+/g, ' ');
+            lines.push('  题1 原始结构（截 900 字）：' + dbgHtml.slice(0, 900));
+        }
+        if (isSpocCourse()) {
+            lines.push('  dwr paper：' + (SPOC_DWR.paper && SPOC_DWR.paper.objectiveQList
+                ? '已捕获 ' + SPOC_DWR.paper.objectiveQList.length + ' 题'
+                : '未捕获（切一次内容再点诊断）'));
+            if (SPOC_DWR.paper) {
+                var dbgQs = spocParsePaper(SPOC_DWR.paper);
+                for (var qi = 0; qi < dbgQs.length && qi < 8; qi++) {
+                    lines.push('  答案' + (qi + 1) + '「' + cleanText(dbgQs[qi].title).slice(0, 40) + '」'
+                        + lqDescribeAnswer(dbgQs[qi]));
+                }
+            }
+        }
+        lines.push('');
+
+        // 目录/侧栏结构诊断：自动学习的“下一内容”依赖侧栏链接与平台“下一个”按钮
+        lines.push('【目录/侧栏】');
+        var catSels = [
+            '[class*="catalog"]', '[class*="chapter"]', '[class*="lesson"]', '[class*="menu"]',
+            '[class*="sidebar"]', '[class*="mooc-catalog"]', '[class*="mooc-lesson"]', '[class*="mooc-chapter"]',
+            '[class*="mooc-sidebar"]', '[class*="mooc-nav"]', '[class*="course-nav"]', '[class*="learn-nav"]',
+            '[class*="learn-navigation"]', '[class*="learn-list"]', '[class*="learn-lesson"]', '[class*="learn-catalog"]',
+        ];
+        var catSeen = {};
+        for (var ci = 0; ci < catSels.length; ci++) {
+            var cel;
+            try { cel = document.querySelectorAll(catSels[ci]); } catch (e) { continue; }
+            for (var cj = 0; cj < cel.length && cj < 6; cj++) {
+                var ce = cel[cj];
+                if (!isVisible(ce) || catSeen[ce]) continue;
+                catSeen[ce] = true;
+                var ccls = typeof ce.className === 'string' ? ce.className : (ce.getAttribute ? (ce.getAttribute('class') || '') : '');
+                var cown = '';
+                if (ce.tagName === 'A') {
+                    var coh = (ce.getAttribute && ce.getAttribute('href')) || '';
+                    cown = ' href="' + coh.slice(0, 110) + '"';
+                }
+                lines.push('  [' + (cj + 1) + '] <' + String(ce.tagName || '').toLowerCase() + ' class="' + ccls.slice(0, 100) + '"' + cown + '> ' + cleanText((ce.textContent || '').slice(0, 16)));
+                var aels = ce.querySelectorAll('a[href*="/content/"], a[href*="id="], [data-content-id], [data-id]');
+                var shownA = 0;
+                for (var ak = 0; ak < aels.length && shownA < 8; ak++) {
+                    var ae = aels[ak];
+                    var ah = (ae.getAttribute && ae.getAttribute('href')) || '';
+                    var aid = (ae.getAttribute && (ae.getAttribute('data-content-id') || ae.getAttribute('data-id'))) || '';
+                    var atxt = cleanText((ae.textContent || '').slice(0, 20));
+                    if (!ah && !aid && !atxt) continue;
+                    lines.push('      <a href="' + ah.slice(0, 110) + '" data="' + aid + '"> ' + atxt);
+                    shownA++;
+                }
+            }
+        }
+        lines.push('【所有 learn-navigation / 本课程链接】');
+        var allNav = document.querySelectorAll('a[class*="navigation"], a[class*="learn-nav"], a[href*="/mooc/learn/"], a[href*="/content/"]');
+        var shownNav = 0;
+        var navSeen = {};
+        for (var nv = 0; nv < allNav.length && shownNav < 16; nv++) {
+            var nav = allNav[nv];
+            if (!isVisible(nav) || navSeen[nav]) continue;
+            navSeen[nav] = true;
+            var navcls = typeof nav.className === 'string' ? nav.className : (nav.getAttribute ? (nav.getAttribute('class') || '') : '');
+            var navhref = (nav.getAttribute && nav.getAttribute('href')) || '';
+            var navtxt = cleanText((nav.textContent || '').slice(0, 20));
+            lines.push('  <a class="' + navcls.slice(0, 80) + '" href="' + navhref.slice(0, 120) + '"> ' + navtxt);
+            shownNav++;
+        }
+        if (shownNav === 0) lines.push('  （页面里没有任何 /mooc/learn 或 /content 链接）');
+        lines.push('【“下一个/下一节”入口】');
+        var nextEls = document.querySelectorAll('a, button, [role="button"]');
+        var shownN = 0;
+        for (var nk = 0; nk < nextEls.length && shownN < 6; nk++) {
+            var nel = nextEls[nk];
+            if (!isVisible(nel)) continue;
+            var nlabel = nel.getAttribute ? (nel.getAttribute('aria-label') || nel.getAttribute('title') || '') : '';
+            var ntxt = cleanText((nel.textContent || '').slice(0, 8));
+            if (!/下一个|下一节|下一讲|下一章|下一单元|下一课|下个|下页/.test(ntxt) && !/下一个|下一节|下一讲/.test(nlabel)) continue;
+            var ncls2 = typeof nel.className === 'string' ? nel.className : (nel.getAttribute ? (nel.getAttribute('class') || '') : '');
+            var nhref = (nel.getAttribute && nel.getAttribute('href')) || '';
+            lines.push('  <' + String(nel.tagName || '').toLowerCase() + ' class="' + ncls2.slice(0, 80) + '" href="' + nhref.slice(0, 110) + '"> ' + ntxt);
+            shownN++;
+        }
+        if (shownN === 0) lines.push('  （未找到“下一个”入口 —— 将退化为按内容 ID +1 导航）');
+        lines.push('【章节标题候选】');
+        var chs = document.querySelectorAll('[class*="titleBar"], [class*="crumb"], [class*="breadcrumb"], [class*="chapter-title"], [class*="catalog-title"], [class*="mooc-catalog"] h3, [class*="mooc-catalog"] h4, [class*="mooc-catalog"] [class*="title"], [class*="learn-title"], [class*="learn-chapter"], [class*="learn-lesson-title"], [class*="learn-navigation"] h3, [class*="learn-navigation"] h4, [class*="learn-navigation"] [class*="title"]');
+        var shownT = 0;
+        for (var tk = 0; tk < chs.length && shownT < 6; tk++) {
+            var tel = chs[tk];
+            var tt3 = cleanText((tel.textContent || '').slice(0, 30));
+            if (!tt3) continue;
+            var tcls3 = typeof tel.className === 'string' ? tel.className : (tel.getAttribute ? (tel.getAttribute('class') || '') : '');
+            lines.push('  <' + String(tel.tagName || '').toLowerCase() + ' class="' + tcls3.slice(0, 80) + '"> ' + tt3);
+            shownT++;
+        }
+
+        lines.push('【顶部章节/小节下拉按钮】');
+        var ddBtns = document.querySelectorAll('header button[aria-expanded], [class*="header"] button[aria-expanded], nav button[aria-expanded], button[aria-expanded]');
+        var shownD = 0;
+        for (var dk = 0; dk < ddBtns.length && shownD < 8; dk++) {
+            var db = ddBtns[dk];
+            if (!isVisible(db)) continue;
+            var dl = db.getAttribute('aria-label') || '';
+            var dcls = typeof db.className === 'string' ? db.className : (db.getAttribute ? (db.getAttribute('class') || '') : '');
+            var dexp = db.getAttribute('aria-expanded') || '';
+            lines.push('  <button aria-expanded="' + dexp + '" aria-label="' + dl.slice(0, 40) + '" class="' + dcls.slice(0, 80) + '">');
+            shownD++;
+        }
+        if (shownD === 0) lines.push('  （页面里没有找到带 aria-expanded 的下拉按钮）');
+
+        // —— SPOC 结构（MOOC 页面这段基本是空的，填了也不影响阅读）——
+        lines.push('【SPOC 结构】');
+        var sItems = spocUnitItems();
+        lines.push('  内容项 .unitslist > .f-fl：' + sItems.length + ' 个'
+            + (sItems.length ? '，当前索引=' + spocCurrentIndex(sItems) : ''));
+        for (var si = 0; si < sItems.length && si < 12; si++) {
+            var sCls = typeof sItems[si].className === 'string' ? sItems[si].className : '';
+            lines.push('    [' + (spocCurrentIndex(sItems) === si ? '*' : ' ') + '] ' + cleanText(sItems[si].textContent).slice(0, 24)
+                + '  class="' + sCls.slice(0, 60) + '"');
+        }
+        var sUps = document.querySelectorAll('.up.j-up');
+        lines.push('  章节/小节下拉 .up.j-up：' + sUps.length + ' 个');
+        for (var ui = 0; ui < sUps.length && ui < 4; ui++) {
+            lines.push('    [' + ui + '] ' + cleanText(sUps[ui].textContent).slice(0, 30));
+        }
+        var sLists = document.querySelectorAll('.down.j-list');
+        for (var li2 = 0; li2 < sLists.length && li2 < 4; li2++) {
+            var sLis = sLists[li2].querySelectorAll('.list');
+            lines.push('  下拉面板[' + li2 + '] .list：' + sLis.length + ' 项'
+                + (sLis.length ? '，首项=' + cleanText(sLis[0].textContent).slice(0, 20) : ''));
+        }
+        var sTabs = document.querySelectorAll('.learn-unit-tabs-scroll button');
+        if (sTabs.length) {
+            var tabStr = [];
+            for (var ti = 0; ti < sTabs.length && ti < 10; ti++) {
+                tabStr.push(cleanText(sTabs[ti].textContent).slice(0, 10) || '（无文字）');
+            }
+            lines.push('  内容标签栏 .learn-unit-tabs-scroll：' + sTabs.length + ' 个 → ' + tabStr.join(' / '));
+            lines.push('  当前激活标签文字：' + (spocActiveTabText() || '（未识别）'));
+        }
+        lines.push('  题块 .m-choiceQuestion：' + document.querySelectorAll('.m-choiceQuestion').length + ' 个');
+        lines.push('  提交 .j-submit：' + document.querySelectorAll('.j-submit').length
+            + ' 个；重做 .j-replay：' + document.querySelectorAll('.j-replay').length + ' 个');
+        lines.push('  讨论区 .m-data-lists：' + document.querySelectorAll('.m-data-lists').length
+            + ' 个；编辑器 .ql-editor：' + document.querySelectorAll('.ql-editor').length + ' 个');
+        lines.push('  dwr paper：' + (SPOC_DWR.paper ? '已捕获' : '未捕获')
+            + '；dwr hook：' + (SPOC_DWR.patched ? '已挂' : '未挂')
+            + '；见过 dwr 请求：' + (SPOC_DWR.sawRequest ? '是' : '否'));
+        lines.push('');
+
+        lines.push('【内容标签栏 role=tablist】');
+        var tablists = document.querySelectorAll('[role="tablist"]');
+        var shownTab = 0;
+        for (var tl = 0; tl < tablists.length && tl < 3; tl++) {
+            var tbs = tablists[tl].querySelectorAll('[role="tab"]');
+            for (var tb = 0; tb < tbs.length && shownTab < 24; tb++) {
+                var lb = tbs[tb].getAttribute('aria-label') || '';
+                var sel = tbs[tb].getAttribute('aria-selected') || '';
+                lines.push('  <tab aria-selected="' + sel + '" aria-label="' + lb.slice(0, 40) + '"> ' + cleanText((tbs[tb].textContent || '').slice(0, 20)));
+                shownTab++;
+            }
+        }
+        if (tablists.length === 0) lines.push('  （页面里没有 role=tablist 标签栏）');
+
+        lines.push('—— 把以上内容完整复制并发给作者，即可精准适配新版 UI ——');
+        showTextOverlay('页面 DOM 诊断（请复制全部内容）', lines.join('\n'));
+        updateStatus('🔎 已生成页面 DOM 诊断，浮层里可直接复制');
+    }
+
+    // ===================== 初始化 =====================
+    function init() {
+        // 恢复上次的复制开关状态（页面刷新后不用再点一次）
+        applyCopyUnlock(isCopyUnlockOn());
+        createFloatingPanel();
+        // 悬浮【下一节】按钮（自动学习运行时显示）
+        createFloatNextBtn();
+        // SPOC：尽早挂 dwr hook，后续每次切内容都能把 paper 收下来。
+        // 只观测 getLessonUnitLearnVo 的请求，不改写任何响应，MOOC 页面不会走到这里。
+        if (isSpocCourse()) {
+            spocHookDwr();
+            logDebug('init', '课程类型＝SPOC，已挂载 dwr hook');
+        } else {
+            logDebug('init', '课程类型＝MOOC');
+        }
+        updateStatus('就绪 · ' + courseUiLabel() + ' 课程');
+        // 新版路径路由整页刷新后，接着跑上次未完成的自动学习
+        resumeLearn();
+    }
+    if (document.readyState === 'complete' || document.readyState === 'interactive') {
+        setTimeout(init, 1000);
+    } else {
+        window.addEventListener('load', function () { setTimeout(init, 1000); });
+    }
+})();
