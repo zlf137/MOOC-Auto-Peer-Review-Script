@@ -1,7 +1,8 @@
 // ==UserScript==
-// @name         中国大学MOOC-自动互评
-// @namespace    https://github.com/zlf137/MOOC-Auto-Peer-Review-Script
-// @version      3.0.0
+// @name         中国大学MOOC-自动化
+// @name:zh-CN   中国大学MOOC-自动互评
+// @namespace    https://github.com/weiy02/ChinaMOOC-Auto
+// @version      3.0.1
 // @description  中国大学 MOOC / SPOC 互评专用用户脚本：默认连续互评 6 份，支持自定义份数按钮、右键删除与随时停止。
 // @author       weiy02, zlf137
 // @match        *://www.icourse163.org/*
@@ -28,7 +29,10 @@
     };
 
     var COUNTS_KEY = 'mar.reviewCounts';
-    var PANEL_ID = 'mooc-auto-peer-review-panel';
+    // 保留旧版 name + namespace，让 2.x 安装能被本版本直接覆盖；
+    // 页面元素使用全新的前缀，避免与更早期、不同身份的旧脚本串线。
+    var PANEL_ID = 'mooc-auto-peer-review-panel-v3';
+    var LEGACY_PANEL_ID = 'mooc-auto-review-panel';
     var STYLE_ID = 'mooc-auto-peer-review-style';
     var taskState = { running: false, cancelled: false };
     var statusEl = null;
@@ -389,38 +393,47 @@
         style.textContent = [
             '#' + PANEL_ID + ' { position: fixed; top: 92px; right: 20px; z-index: 2147483646; width: 252px; overflow: hidden; border: 1px solid rgba(255,255,255,.09); border-radius: 12px; background: #18181b; color: #ededed; box-shadow: 0 14px 36px rgba(0,0,0,.36); font-family: -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif; }',
             '#' + PANEL_ID + ' * { box-sizing: border-box; }',
-            '#mar-header { display:flex; justify-content:space-between; align-items:center; padding:10px 12px; cursor:move; border-bottom:1px solid rgba(255,255,255,.07); }',
-            '#mar-title { display:flex; align-items:center; gap:7px; font-size:12.5px; font-weight:600; }',
+            '#mapr-header { display:flex; justify-content:space-between; align-items:center; padding:10px 12px; cursor:move; border-bottom:1px solid rgba(255,255,255,.07); }',
+            '#mapr-title { display:flex; align-items:center; gap:7px; font-size:12.5px; font-weight:600; }',
             '.mar-dot { width:6px; height:6px; border-radius:50%; background:#3b82f6; }',
-            '#mar-minimize { width:22px; height:22px; padding:0; border:0; border-radius:6px; background:transparent; color:#8a8a90; cursor:pointer; }',
-            '#mar-minimize:hover { background:rgba(255,255,255,.08); color:#ededed; }',
-            '#mar-body { padding:8px; }',
-            '#mar-review-counts { display:flex; flex-direction:column; gap:6px; margin-bottom:6px; }',
+            '#mapr-minimize { width:22px; height:22px; padding:0; border:0; border-radius:6px; background:transparent; color:#8a8a90; cursor:pointer; }',
+            '#mapr-minimize:hover { background:rgba(255,255,255,.08); color:#ededed; }',
+            '#mapr-body { padding:8px; }',
+            '#mapr-legacy-warning { display:none; margin-bottom:7px; padding:8px; border:1px solid rgba(248,113,113,.36); border-radius:8px; background:rgba(248,113,113,.12); color:#fca5a5; font-size:11px; line-height:1.55; }',
+            '#mapr-review-counts { display:flex; flex-direction:column; gap:6px; margin-bottom:6px; }',
             '.mar-btn { display:flex; align-items:center; width:100%; padding:8px 10px; border:1px solid transparent; border-radius:8px; background:rgba(255,255,255,.055); color:#e4e4e7; font:400 12px inherit; text-align:left; cursor:pointer; }',
             '.mar-btn:hover:not(:disabled) { background:rgba(255,255,255,.1); }',
             '.mar-btn:disabled { opacity:.34; cursor:not-allowed; }',
-            '#mar-review-custom:not(:disabled) { color:#60a5fa; }',
+            '#mapr-review-custom:not(:disabled) { color:#60a5fa; }',
             '.mar-review-delete:not(:disabled) { color:#f87171; background:rgba(248,113,113,.12); border-color:rgba(248,113,113,.32); }',
-            '#mar-foot { display:flex; flex-direction:column; gap:6px; padding:0 8px 10px; }',
-            '#mar-stop { display:none; color:#f87171; background:rgba(248,113,113,.1); }',
-            '#mar-status { min-height:16px; padding:6px 2px 0; color:#8a8a90; font-size:11px; line-height:1.55; word-break:break-word; }',
+            '#mapr-foot { display:flex; flex-direction:column; gap:6px; padding:0 8px 10px; }',
+            '#mapr-stop { display:none; color:#f87171; background:rgba(248,113,113,.1); }',
+            '#mapr-status { min-height:16px; padding:6px 2px 0; color:#8a8a90; font-size:11px; line-height:1.55; word-break:break-word; }',
         ].join('\n');
         (document.head || document.documentElement).appendChild(style);
     }
 
     function setButtonsRunning(running) {
+        var legacyConflict = !!document.getElementById(LEGACY_PANEL_ID);
         var buttons = document.querySelectorAll('#' + PANEL_ID + ' .mar-btn');
         for (var i = 0; i < buttons.length; i++) {
-            if (buttons[i].id !== 'mar-stop') buttons[i].disabled = running;
+            if (buttons[i].id !== 'mapr-stop') buttons[i].disabled = running || legacyConflict;
         }
-        var stop = document.getElementById('mar-stop');
+        var stop = document.getElementById('mapr-stop');
         if (stop) {
             stop.style.display = running ? 'flex' : 'none';
             stop.disabled = !running;
         }
+        var warning = document.getElementById('mapr-legacy-warning');
+        if (warning) warning.style.display = legacyConflict ? 'block' : 'none';
     }
 
     function runGuarded(task) {
+        if (document.getElementById(LEGACY_PANEL_ID)) {
+            updateStatus('⚠️ 已暂停：请先在脚本管理器中禁用或删除旧版脚本');
+            setButtonsRunning(false);
+            return;
+        }
         if (taskState.running) {
             updateStatus('正在执行中，请先停止或等待完成…');
             return;
@@ -444,25 +457,26 @@
         var panel = document.createElement('div');
         panel.id = PANEL_ID;
         panel.innerHTML = [
-            '<div id="mar-header">',
-            '  <span id="mar-title"><span class="mar-dot"></span>MOOC 互评</span>',
-            '  <button id="mar-minimize" title="最小化">−</button>',
+            '<div id="mapr-header">',
+            '  <span id="mapr-title"><span class="mar-dot"></span>MOOC 互评</span>',
+            '  <button id="mapr-minimize" title="最小化">−</button>',
             '</div>',
-            '<div id="mar-main">',
-            '  <div id="mar-body">',
-            '    <div id="mar-review-counts"></div>',
-            '    <button id="mar-review-custom" class="mar-btn">自定义互评份数</button>',
+            '<div id="mapr-main">',
+            '  <div id="mapr-body">',
+            '    <div id="mapr-legacy-warning">检测到旧版“中国大学MOOC”脚本仍在运行。为避免两份脚本同时操作，本版已暂停；请先在脚本管理器中禁用或删除旧版，然后刷新页面。</div>',
+            '    <div id="mapr-review-counts"></div>',
+            '    <button id="mapr-review-custom" class="mar-btn">自定义互评份数</button>',
             '  </div>',
-            '  <div id="mar-foot">',
-            '    <button id="mar-stop" class="mar-btn">停止当前操作</button>',
-            '    <div id="mar-status">就绪</div>',
+            '  <div id="mapr-foot">',
+            '    <button id="mapr-stop" class="mar-btn">停止当前操作</button>',
+            '    <div id="mapr-status">就绪</div>',
             '  </div>',
             '</div>',
         ].join('');
         document.body.appendChild(panel);
-        statusEl = document.getElementById('mar-status');
+        statusEl = document.getElementById('mapr-status');
 
-        var countsBox = document.getElementById('mar-review-counts');
+        var countsBox = document.getElementById('mapr-review-counts');
 
         function resetDeleteMode() {
             var armed = countsBox.querySelectorAll('.mar-review-delete');
@@ -515,7 +529,7 @@
             updateStatus('已退出删除模式');
         });
 
-        document.getElementById('mar-review-custom').addEventListener('click', function () {
+        document.getElementById('mapr-review-custom').addEventListener('click', function () {
             var input = window.prompt('请输入互评份数（1–' + CONFIG.MAX_COUNT + '）：', String(CONFIG.DEFAULT_COUNT));
             if (input === null) return;
             var count = Number(String(input).trim());
@@ -534,28 +548,28 @@
             updateStatus('已添加「互评 ' + count + ' 份」按钮');
         });
 
-        document.getElementById('mar-stop').addEventListener('click', function () {
+        document.getElementById('mapr-stop').addEventListener('click', function () {
             if (!taskState.running) return;
             taskState.cancelled = true;
             updateStatus('⏹ 正在停止…');
         });
 
         var minimized = false;
-        var main = document.getElementById('mar-main');
-        document.getElementById('mar-minimize').addEventListener('click', function () {
+        var main = document.getElementById('mapr-main');
+        document.getElementById('mapr-minimize').addEventListener('click', function () {
             minimized = !minimized;
             main.style.display = minimized ? 'none' : '';
             this.textContent = minimized ? '+' : '−';
         });
 
-        var header = document.getElementById('mar-header');
+        var header = document.getElementById('mapr-header');
         var dragging = false;
         var startX = 0;
         var startY = 0;
         var startLeft = 0;
         var startTop = 0;
         header.addEventListener('mousedown', function (event) {
-            if (event.target && event.target.id === 'mar-minimize') return;
+            if (event.target && event.target.id === 'mapr-minimize') return;
             dragging = true;
             startX = event.clientX;
             startY = event.clientY;
@@ -579,5 +593,6 @@
     createPanel();
     new MutationObserver(function () {
         if (!document.getElementById(PANEL_ID)) createPanel();
+        else setButtonsRunning(taskState.running);
     }).observe(document.documentElement, { childList: true, subtree: true });
 })();
